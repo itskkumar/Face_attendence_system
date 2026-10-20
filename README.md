@@ -1,3 +1,4 @@
+<img width="1463" height="833" alt="Screenshot 2026-10-20 at 9 39 55 PM" src="https://github.com/user-attachments/assets/83604afb-c8fc-4f26-b0d8-e2ccdb19527d" />
 # Real-Time Face Recognition, Attendance & Counting System — v2
 
 Gate-camera attendance for a college: detects **every** face in view (groups of 3+ are fine), tracks each
