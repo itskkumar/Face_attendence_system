@@ -1,0 +1,6 @@
+[server]
+# CCTV clips are often larger than Streamlit's 200 MB default
+maxUploadSize = 2048
+
+[browser]
+gatherUsageStats = false

@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+.pytest_cache/
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/provider_choice.json
+*.mp4
