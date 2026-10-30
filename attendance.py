@@ -17,10 +17,11 @@ from database import Store, StudentInfo
 
 class AttendanceLogger:
     def __init__(self, store: Store, cooldown_seconds: int, source: str = "live",
-                 clock: Callable[[], datetime] = datetime.now):
+                 camera_label: str = "default", clock: Callable[[], datetime] = datetime.now):
         self.store = store
         self.cooldown_seconds = cooldown_seconds
         self.source = source
+        self.camera_label = camera_label
         self.clock = clock
         self.last_seen_dict: Dict[str, datetime] = {}
         self._lock = threading.Lock()
@@ -37,7 +38,7 @@ class AttendanceLogger:
             return False
         logged, last = self.store.log_attendance(
             student.roll_number, student.name, student.id, similarity, direction,
-            self.source, self.cooldown_seconds, now=self.clock())
+            self.source, self.cooldown_seconds, now=self.clock(), camera_label=self.camera_label)
         if last is not None:
             with self._lock:
                 self.last_seen_dict[student.roll_number] = last

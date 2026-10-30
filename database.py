@@ -35,7 +35,12 @@ CREATE TABLE IF NOT EXISTS students (
     roll_number TEXT NOT NULL UNIQUE,
     name        TEXT NOT NULL,
     embedding   BLOB NOT NULL,              -- centroid / profile vector (512 x float32)
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    email       TEXT,
+    phone       TEXT,
+    department  TEXT,
+    batch       TEXT,
+    expected_time TEXT                      -- expected arrival time HH:MM
 );
 CREATE TABLE IF NOT EXISTS face_templates (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,10 +58,35 @@ CREATE TABLE IF NOT EXISTS attendance_logs (
     timestamp   TEXT NOT NULL,
     direction   TEXT NOT NULL DEFAULT 'ENTRY',
     similarity  REAL,
-    source      TEXT
+    source      TEXT,
+    camera_label TEXT DEFAULT 'default'    -- multi-camera support
 );
 CREATE INDEX IF NOT EXISTS idx_logs_ts   ON attendance_logs(timestamp);
 CREATE INDEX IF NOT EXISTS idx_logs_roll ON attendance_logs(roll_number, timestamp);
+CREATE INDEX IF NOT EXISTS idx_logs_camera ON attendance_logs(camera_label);
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp   TEXT NOT NULL,
+    user        TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    details     TEXT,
+    ip_address  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(timestamp);
+CREATE TABLE IF NOT EXISTS users (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    username    TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role        TEXT NOT NULL DEFAULT 'viewer',  -- admin | viewer
+    created_at  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS system_health (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp   TEXT NOT NULL,
+    metric      TEXT NOT NULL,
+    value       REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_health_ts ON system_health(timestamp);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -183,7 +213,9 @@ class Store:
                        int(version_row["value"]) if version_row else 0)
 
     def add_student(self, roll_number: str, name: str, embeddings: Sequence[np.ndarray],
-                    qualities: Optional[Sequence[float]] = None, mode: str = "replace") -> Tuple[int, int]:
+                    qualities: Optional[Sequence[float]] = None, mode: str = "replace",
+                    email: str = "", phone: str = "", department: str = "",
+                    batch: str = "", expected_time: str = "") -> Tuple[int, int]:
         """Enrol (or update) a student. mode='replace' swaps all templates, 'append' adds."""
         roll_number, name = roll_number.strip().upper(), name.strip()
         if not roll_number or not name:
@@ -198,8 +230,8 @@ class Store:
             row = c.execute("SELECT id FROM students WHERE roll_number=?", (roll_number,)).fetchone()
             if row is None:
                 sid = c.execute(
-                    "INSERT INTO students(roll_number, name, embedding, created_at) VALUES(?,?,?,?)",
-                    (roll_number, name, _blob(embs[0]), now)).lastrowid
+                    "INSERT INTO students(roll_number, name, embedding, created_at, email, phone, department, batch, expected_time) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (roll_number, name, _blob(embs[0]), now, email, phone, department, batch, expected_time)).lastrowid
             else:
                 sid = row["id"]
                 if mode == "replace":
@@ -215,7 +247,8 @@ class Store:
             mat = np.vstack([_unblob(r["embedding"]) for r in rows])
             w = np.maximum(np.array([r["quality"] for r in rows], dtype=np.float32), 1e-3)
             centroid = l2_normalize((mat * w[:, None]).sum(axis=0))
-            c.execute("UPDATE students SET name=?, embedding=? WHERE id=?", (name, _blob(centroid), sid))
+            c.execute("UPDATE students SET name=?, embedding=?, email=?, phone=?, department=?, batch=?, expected_time=? WHERE id=?",
+                     (name, _blob(centroid), email, phone, department, batch, expected_time, sid))
             self._bump_version(c)
             n = len(rows)
         return int(sid), n
@@ -250,8 +283,8 @@ class Store:
     # ------------------------------------------------------------- attendance
     def log_attendance(self, roll_number: str, name: str, student_id: Optional[int],
                        similarity: float, direction: str, source: str,
-                       cooldown_seconds: int, now: Optional[datetime] = None
-                       ) -> Tuple[bool, Optional[datetime]]:
+                       cooldown_seconds: int, now: Optional[datetime] = None,
+                       camera_label: str = "default") -> Tuple[bool, Optional[datetime]]:
         """
         Insert a log row unless this person was already logged within the cooldown.
         Returns (logged, last_logged_time). Atomic across threads and processes.
@@ -264,9 +297,9 @@ class Store:
             if last is not None and (now - last).total_seconds() < cooldown_seconds:
                 return False, last
             c.execute(
-                "INSERT INTO attendance_logs(student_id, roll_number, name, timestamp, direction, similarity, source) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (student_id, roll_number, name, _ts(now), direction, float(similarity), source))
+                "INSERT INTO attendance_logs(student_id, roll_number, name, timestamp, direction, similarity, source, camera_label) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (student_id, roll_number, name, _ts(now), direction, float(similarity), source, camera_label))
         return True, now
 
     def last_seen_since(self, seconds: int, now: Optional[datetime] = None) -> Dict[str, datetime]:
@@ -307,6 +340,215 @@ class Store:
             rows = c.execute("SELECT id, timestamp, roll_number, name, direction, similarity, source "
                              "FROM attendance_logs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
+
+    def today_known_count(self, now: Optional[datetime] = None) -> int:
+        """Count unique known persons (enrolled students) detected today."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT COUNT(DISTINCT roll_number) FROM attendance_logs "
+                "WHERE timestamp >= ? AND student_id IS NOT NULL",
+                (self._today_start(now),)).fetchone()[0]
+
+    def today_unknown_count(self, now: Optional[datetime] = None) -> int:
+        """Count unique unknown persons (not enrolled) detected today."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT COUNT(DISTINCT roll_number) FROM attendance_logs "
+                "WHERE timestamp >= ? AND student_id IS NULL",
+                (self._today_start(now),)).fetchone()[0]
+
+    # ----------------------------------------------------------- Search & Filter
+    def search_logs(self, start_date: Optional[str] = None, end_date: Optional[str] = None,
+                    roll_number: Optional[str] = None, name: Optional[str] = None,
+                    camera_label: Optional[str] = None, limit: int = 1000) -> List[dict]:
+        """Search attendance logs with filters."""
+        with self._conn() as c:
+            query = "SELECT * FROM attendance_logs WHERE 1=1"
+            params = []
+            if start_date:
+                query += " AND timestamp >= ?"
+                params.append(start_date)
+            if end_date:
+                query += " AND timestamp <= ?"
+                params.append(end_date + " 23:59:59")
+            if roll_number:
+                query += " AND roll_number LIKE ?"
+                params.append(f"%{roll_number}%")
+            if name:
+                query += " AND name LIKE ?"
+                params.append(f"%{name}%")
+            if camera_label:
+                query += " AND camera_label = ?"
+                params.append(camera_label)
+            query += " ORDER BY timestamp DESC LIMIT ?"
+            params.append(limit)
+            rows = c.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_student_profile(self, roll_number: str) -> Optional[dict]:
+        """Get complete student profile with statistics."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM students WHERE roll_number = ?",
+                (roll_number.strip().upper(),)
+            ).fetchone()
+            if not row:
+                return None
+            profile = dict(row)
+            # Add attendance stats
+            total = c.execute(
+                "SELECT COUNT(*) FROM attendance_logs WHERE roll_number = ?",
+                (roll_number.strip().upper(),)
+            ).fetchone()[0]
+            profile['total_attendance'] = total
+            return profile
+
+    def get_attendance_percentage(self, roll_number: str, days: int = 30) -> float:
+        """Calculate attendance percentage for a student."""
+        cutoff = _ts((_now() - timedelta(days=days)))
+        with self._conn() as c:
+            attended = c.execute(
+                "SELECT COUNT(DISTINCT DATE(timestamp)) FROM attendance_logs "
+                "WHERE roll_number = ? AND timestamp >= ?",
+                (roll_number.strip().upper(), cutoff)
+            ).fetchone()[0]
+        return (attended / days * 100) if days > 0 else 0.0
+
+    # ----------------------------------------------------------- Analytics
+    def get_peak_hours(self, days: int = 7) -> List[Tuple[int, int]]:
+        """Get peak attendance hours over the last N days."""
+        cutoff = _ts((_now() - timedelta(days=days)))
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT CAST(substr(timestamp, 12, 2) AS INTEGER) AS hour, COUNT(*) AS count "
+                "FROM attendance_logs WHERE timestamp >= ? "
+                "GROUP BY hour ORDER BY count DESC",
+                (cutoff,)
+            ).fetchall()
+        return [(r['hour'], r['count']) for r in rows]
+
+    def get_absent_students(self, days: int = 7) -> List[dict]:
+        """Get students who haven't attended in the last N days."""
+        cutoff = _ts((_now() - timedelta(days=days)))
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT s.roll_number, s.name, s.department, s.batch "
+                "FROM students s WHERE s.roll_number NOT IN "
+                "(SELECT DISTINCT roll_number FROM attendance_logs WHERE timestamp >= ?)",
+                (cutoff,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_late_arrivals(self, date: Optional[str] = None, threshold_hour: int = 9) -> List[dict]:
+        """Get students who arrived after a certain hour."""
+        if not date:
+            date = _now().strftime("%Y-%m-%d")
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT roll_number, name, timestamp, "
+                "CAST(substr(timestamp, 12, 2) AS INTEGER) AS hour "
+                "FROM attendance_logs "
+                "WHERE DATE(timestamp) = ? AND CAST(substr(timestamp, 12, 2) AS INTEGER) >= ? "
+                "ORDER BY timestamp",
+                (date, threshold_hour)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_attendance_trends(self, days: int = 30) -> List[Tuple[str, int, int]]:
+        """Get daily attendance trends (date, unique_count, total_scans)."""
+        cutoff = _ts((_now() - timedelta(days=days)))
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT DATE(timestamp) AS date, "
+                "COUNT(DISTINCT roll_number) AS unique_count, "
+                "COUNT(*) AS total_scans "
+                "FROM attendance_logs WHERE timestamp >= ? "
+                "GROUP BY DATE(timestamp) ORDER BY date",
+                (cutoff,)
+            ).fetchall()
+        return [(r['date'], r['unique_count'], r['total_scans']) for r in rows]
+
+    def get_camera_stats(self) -> List[dict]:
+        """Get statistics per camera."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT camera_label, COUNT(*) AS total, "
+                "COUNT(DISTINCT roll_number) AS unique_persons "
+                "FROM attendance_logs GROUP BY camera_label"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ----------------------------------------------------------- Audit & Security
+    def log_audit(self, user: str, action: str, details: str = "", ip_address: str = "") -> None:
+        """Log admin action for audit trail."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO audit_logs(timestamp, user, action, details, ip_address) VALUES(?,?,?,?,?)",
+                (_ts(_now()), user, action, details, ip_address)
+            )
+
+    def get_audit_logs(self, limit: int = 100) -> List[dict]:
+        """Get recent audit logs."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ----------------------------------------------------------- Health Monitoring
+    def log_health_metric(self, metric: str, value: float) -> None:
+        """Log system health metric."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO system_health(timestamp, metric, value) VALUES(?,?,?)",
+                (_ts(_now()), metric, value)
+            )
+
+    def get_health_metrics(self, metric: str, hours: int = 24) -> List[Tuple[str, float]]:
+        """Get health metrics for the last N hours."""
+        cutoff = _ts((_now() - timedelta(hours=hours)))
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT timestamp, value FROM system_health "
+                "WHERE metric = ? AND timestamp >= ? ORDER BY timestamp",
+                (metric, cutoff)
+            ).fetchall()
+        return [(r['timestamp'], r['value']) for r in rows]
+
+    # ----------------------------------------------------------- Bulk Operations
+    def bulk_import_students(self, students_data: List[dict]) -> Tuple[int, int, List[str]]:
+        """Bulk import students from CSV data. Returns (success_count, error_count, error_messages)."""
+        success, errors, error_msgs = 0, 0, []
+        for data in students_data:
+            try:
+                # This would need actual face embeddings - placeholder for now
+                # In practice, you'd need photos or use a default embedding
+                roll = data.get('roll_number', '').strip().upper()
+                name = data.get('name', '').strip()
+                if not roll or not name:
+                    errors += 1
+                    error_msgs.append(f"Missing roll_number or name for entry")
+                    continue
+                # You would need to handle embeddings properly in real implementation
+                # For now, just update metadata if student exists
+                with self._conn() as c:
+                    existing = c.execute("SELECT id FROM students WHERE roll_number=?", (roll,)).fetchone()
+                    if existing:
+                        c.execute(
+                            "UPDATE students SET email=?, phone=?, department=?, batch=?, expected_time=? WHERE roll_number=?",
+                            (data.get('email', ''), data.get('phone', ''), data.get('department', ''),
+                             data.get('batch', ''), data.get('expected_time', ''), roll)
+                        )
+                        success += 1
+                    else:
+                        # Cannot create without embeddings
+                        error_msgs.append(f"Student {roll} does not exist - enroll with photos first")
+                        errors += 1
+            except Exception as e:
+                errors += 1
+                error_msgs.append(f"Error importing {data.get('roll_number', 'unknown')}: {str(e)}")
+        return success, errors, error_msgs
 
 
 def init_db(path: str = DB_PATH) -> None:

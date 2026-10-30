@@ -37,6 +37,7 @@ def main() -> int:
     ap.add_argument("--detect-every", type=int, help="override detector frame interval")
     ap.add_argument("--threshold", type=float, help="override cosine similarity threshold")
     ap.add_argument("--gate-line", action="store_true", help="enable the virtual ENTRY/EXIT line")
+    ap.add_argument("--camera-label", type=str, default="default", help="camera location label (e.g., 'Main Entrance')")
     args = ap.parse_args()
 
     if args.source == "rtsp" and RTSP_PLACEHOLDER_MARKER in args.url:
@@ -68,9 +69,9 @@ def main() -> int:
         print("[inference] warning:", reader.last_error, "\n[inference] will keep retrying ...")
 
     pipeline = GatePipeline(engine, store, settings, source_label=args.source,
-                            is_file=args.source == "file")
+                            is_file=args.source == "file", camera_label=args.camera_label)
     limiter = FpsLimiter(0 if args.source == "file" else settings.target_fps)
-    print(f"[inference] source={reader.describe()} | enrolled={pipeline.gallery.size} | "
+    print(f"[inference] source={reader.describe()} | camera={args.camera_label} | enrolled={pipeline.gallery.size} | "
           f"detect every {pipeline.detect_every} frame(s)")
     if pipeline.gallery.size == 0:
         print("[inference] no students enrolled yet - every face will show as Unknown. Run enrollment.py.")

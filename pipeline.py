@@ -66,11 +66,12 @@ class Identity:
 class GatePipeline:
     def __init__(self, engine, store: Store, settings: Settings, *, source_label: str = "live",
                  is_file: bool = False, logger: Optional[AttendanceLogger] = None,
-                 log_attendance: bool = True):
+                 log_attendance: bool = True, camera_label: str = "default"):
         self.engine = engine
         self.store = store
         self.s = settings
         self.log_attendance = log_attendance
+        self.camera_label = camera_label
         self.detect_every = max(1, settings.file_detect_every_n if is_file else settings.detect_every_n)
         self.display_stale = max(2 * self.detect_every, 4)
         self.tracker = ByteTrackLite(
@@ -78,7 +79,8 @@ class GatePipeline:
             new_thresh=settings.track_new_thresh, match_thresh=settings.track_match_thresh,
             max_age=settings.track_max_age, min_hits=settings.track_min_hits,
             tentative_max_age=max(4, 2 * self.detect_every))
-        self.logger = logger or AttendanceLogger(store, settings.cooldown_seconds, source=source_label)
+        self.logger = logger or AttendanceLogger(store, settings.cooldown_seconds, source=source_label,
+                                                  camera_label=camera_label)
         self.gallery: Gallery = store.load_gallery()
         self._gallery_checked = time.monotonic()
         self.frame_idx = 0

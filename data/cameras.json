@@ -1,0 +1,8 @@
+{
+  "gh": {
+    "type": "RTSP Stream",
+    "source": "http://10.146.48.68:8080",
+    "description": "",
+    "enabled": true
+  }
+}

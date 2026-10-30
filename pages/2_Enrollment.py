@@ -31,9 +31,23 @@ def decode(raw: bytes):
 tab_add, tab_manage = st.tabs(["Enrol a student", "Enrolled students"])
 
 with tab_add:
+    st.markdown("### Basic Information")
     c1, c2 = st.columns(2)
-    name = c1.text_input("Full name")
-    roll = c2.text_input("Roll number")
+    name = c1.text_input("Full name*")
+    roll = c2.text_input("Roll number*")
+
+    st.markdown("### Additional Details (Optional)")
+    c3, c4, c5 = st.columns(3)
+    email = c3.text_input("Email", placeholder="student@example.com")
+    phone = c4.text_input("Phone", placeholder="+1234567890")
+    department = c5.text_input("Department", placeholder="Computer Science")
+
+    c6, c7 = st.columns(2)
+    batch = c6.text_input("Batch/Year", placeholder="2024")
+    expected_time = c7.text_input("Expected Arrival Time", placeholder="09:00")
+
+    st.divider()
+    st.markdown("### Face Photos")
     st.caption("Collect **3-5 photos**: straight on, then turned slightly left / right / up / down. Only the "
                "student should be in the picture; good light, no sunglasses.")
     method = st.radio("Photo source", ["Camera (browser)", "Upload photos"], horizontal=True)
@@ -84,7 +98,11 @@ with tab_add:
                 st.error(f"Refused: this face already matches **{dup[1]}** ({dup[0]}) "
                          f"with similarity {dup[2]:.2f}. Delete or correct that record first.")
             else:
-                _, n = store.add_student(roll, name, embs, [s.quality for s in samples])
+                _, n = store.add_student(
+                    roll, name, embs, [s.quality for s in samples],
+                    email=email, phone=phone, department=department,
+                    batch=batch, expected_time=expected_time
+                )
                 st.success(f"Saved **{name.strip()}** ({roll.strip().upper()}) with {n} template(s). "
                            "Running streams pick this up within a couple of seconds.")
                 samples.clear()
