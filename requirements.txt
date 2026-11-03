@@ -22,6 +22,7 @@ opencv-python==4.10.0.84
 onnxruntime>=1.18,<2
 insightface==0.7.3          # SCRFD-10G detector + ArcFace-R50 (buffalo_l pack, auto-downloaded once, ~280 MB)
 scipy>=1.11,<2              # Hungarian assignment + Kalman maths
+faiss-cpu>=1.8.0            # O(log N) HNSW vector search (optional, fallback to NumPy if unavailable)
 
 # --- data / web ---
 pandas>=2.1,<3

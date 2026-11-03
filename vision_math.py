@@ -126,3 +126,73 @@ def fft_moire_score(aligned_bgr: np.ndarray) -> float:
         return 0.0
     peakiness = float(band.max() / (np.median(band) + 1e-6))
     return float(np.clip(1.0 - (peakiness - 2.5) / 4.0, 0.0, 1.0))
+
+
+def compute_fft_liveness(aligned_face: np.ndarray) -> tuple[float, np.ndarray]:
+    """
+    Passive 2D FFT Frequency-Domain Anti-Spoofing.
+
+    Computes liveness score and spectrum visualization from a 112x112 aligned face crop.
+    Real 3D faces have natural mid-frequency texture from skin pores, while smartphone
+    displays show moiré interference spikes in high frequencies.
+
+    Args:
+        aligned_face: 112x112 BGR face crop (from align_face)
+
+    Returns:
+        liveness_score: float in [0, 1], higher = more likely real
+        spectrum_viz: (112, 112, 3) uint8 COLORMAP_INFERNO heatmap for UI
+    """
+    # Convert to float32 grayscale
+    if aligned_face.ndim == 3:
+        gray = cv2.cvtColor(aligned_face, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    else:
+        gray = aligned_face.astype(np.float32)
+
+    h, w = gray.shape
+
+    # Apply 2D Hann window to eliminate edge spectral leakage
+    hann_h = np.hanning(h)
+    hann_w = np.hanning(w)
+    window_2d = hann_h[:, None] @ hann_w[None, :]
+
+    # Center the signal
+    gray_centered = gray - gray.mean()
+    windowed = gray_centered * window_2d
+
+    # Compute 2D DFT, shift zero-frequency to center, log-magnitude spectrum
+    fft_2d = np.fft.fft2(windowed)
+    fft_shift = np.fft.fftshift(fft_2d)
+    magnitude_spectrum = np.log1p(np.abs(fft_shift))
+
+    # Compute radial frequency ring energies around center
+    cy, cx = h // 2, w // 2
+    yy, xx = np.ogrid[:h, :w]
+    radius = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+
+    # Define frequency bands
+    mid_freq_mask = (radius >= 8) & (radius <= 28)    # Natural 3D skin texture
+    high_freq_mask = radius > 28                       # OLED/LCD moiré spikes
+    total_ac_mask = radius >= 4                        # All AC band (exclude DC)
+
+    # Compute band energies
+    mid_energy = float(magnitude_spectrum[mid_freq_mask].sum()) if mid_freq_mask.any() else 0.0
+    high_energy = float(magnitude_spectrum[high_freq_mask].sum()) if high_freq_mask.any() else 0.0
+    total_energy = float(magnitude_spectrum[total_ac_mask].sum()) if total_ac_mask.any() else 1e-6
+
+    # Calculate liveness score: favor mid-frequency over high-frequency
+    # Real faces have higher mid-freq energy; spoofs show high-freq spikes
+    liveness_score = float(np.clip(
+        ((mid_energy - 0.65 * high_energy) / (total_energy + 1e-6)) * 1.15,
+        0.0, 1.0
+    ))
+
+    # Create colorized spectrum visualization (COLORMAP_INFERNO)
+    # Normalize spectrum for visualization
+    spectrum_norm = magnitude_spectrum.copy()
+    spectrum_norm = (spectrum_norm - spectrum_norm.min()) / (spectrum_norm.max() - spectrum_norm.min() + 1e-9)
+    spectrum_uint8 = (spectrum_norm * 255).astype(np.uint8)
+    spectrum_viz = cv2.applyColorMap(spectrum_uint8, cv2.COLORMAP_INFERNO)
+
+    return liveness_score, spectrum_viz
+

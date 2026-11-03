@@ -93,6 +93,22 @@ class Settings:
     # ---- Liveness (EXPERIMENTAL, off by default) ----------------------------
     liveness_mode: str = "off"                  # off | fft_experimental
     liveness_min_score: float = 0.35
+    enable_fft_liveness: bool = True            # Enable 2D FFT frequency-domain anti-spoofing
+    min_fft_liveness_score: float = 0.48        # Minimum FFT liveness score to pass gate
+
+    # ---- Deferred recognition (for fast-moving persons) ---------------------
+    enable_deferred_recognition: bool = True    # process tracks that left frame while pending
+    buffer_crops_for_deferred: int = 5          # keep best N frame crops per track
+    deferred_min_embeddings: int = 2            # need at least this many to attempt deferred ID
+
+    # ---- Snapshots (save face/person crops when logging attendance) ---------
+    save_snapshots: bool = False                # save face and person crops on attendance log
+
+    # ---- FAISS HNSW vector search (O(log N) approximate nearest neighbor) ---
+    enable_faiss_hnsw: bool = True              # Use FAISS HNSW index if available, fallback to NumPy
+    faiss_hnsw_m: int = 32                      # HNSW graph connectivity parameter
+    faiss_ef_construction: int = 64             # Build-time search depth
+    faiss_ef_search: int = 32                   # Query-time search depth
 
 
 DEFAULT_SETTINGS = Settings()

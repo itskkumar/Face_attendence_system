@@ -50,6 +50,25 @@ def migrate_database():
             else:
                 raise
 
+        # Add snapshot columns to attendance_logs table
+        try:
+            cursor.execute("ALTER TABLE attendance_logs ADD COLUMN face_snapshot TEXT")
+            print("   ✓ Added column: face_snapshot")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" in str(e):
+                print("   - Column face_snapshot already exists")
+            else:
+                raise
+
+        try:
+            cursor.execute("ALTER TABLE attendance_logs ADD COLUMN person_snapshot TEXT")
+            print("   ✓ Added column: person_snapshot")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" in str(e):
+                print("   - Column person_snapshot already exists")
+            else:
+                raise
+
         # Create index on camera_label
         try:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_logs_camera ON attendance_logs(camera_label)")

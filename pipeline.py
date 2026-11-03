@@ -13,13 +13,18 @@ Per frame
      and are periodically re-verified so a track-ID swap cannot mislabel anyone
   6. Boxes are drawn EVERY frame from the Kalman state, so they never flicker
      on frames where the detector was skipped
+  7. (Optional) Deferred recognition: tracks that leave the frame while pending
+     are queued for background processing using buffered frame crops
 """
 from __future__ import annotations
 
+import queue
+import threading
 import time
 import unicodedata
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Deque, Dict, List, Optional, Tuple
 
 import cv2
@@ -28,8 +33,9 @@ import numpy as np
 from attendance import AttendanceLogger
 from config import Settings
 from database import Gallery, Store, StudentInfo
+from snapshot_manager import save_snapshot
 from tracker import ByteTrackLite, Detection, Track
-from vision_math import align_face, fft_moire_score, l2_normalize, laplacian_variance, pose_score
+from vision_math import align_face, compute_fft_liveness, fft_moire_score, l2_normalize, laplacian_variance, pose_score
 
 GREEN = (113, 204, 46)     # BGR
 RED = (60, 60, 230)
@@ -61,6 +67,10 @@ class Identity:
     ever_unknown: bool = False
     hint: str = ""
     blur: float = 0.0
+    # For deferred recognition (fast-moving persons)
+    frame_crops: Deque[Tuple[np.ndarray, float]] = field(default_factory=lambda: deque(maxlen=5))  # (BGR crop, quality)
+    best_aligned_face: Optional[np.ndarray] = None          # 112x112 aligned face for snapshot
+    best_person_crop: Optional[np.ndarray] = None           # bounding box crop for snapshot
 
 
 class GatePipeline:
@@ -78,7 +88,8 @@ class GatePipeline:
             high_thresh=settings.track_high_thresh, low_thresh=settings.track_low_thresh,
             new_thresh=settings.track_new_thresh, match_thresh=settings.track_match_thresh,
             max_age=settings.track_max_age, min_hits=settings.track_min_hits,
-            tentative_max_age=max(4, 2 * self.detect_every))
+            tentative_max_age=max(4, 2 * self.detect_every),
+            on_track_lost=self._on_track_lost if settings.enable_deferred_recognition else None)
         self.logger = logger or AttendanceLogger(store, settings.cooldown_seconds, source=source_label,
                                                   camera_label=camera_label)
         self.gallery: Gallery = store.load_gallery()
@@ -92,6 +103,15 @@ class GatePipeline:
         self.events: Deque[str] = deque(maxlen=12)
         self.session_logged = 0
 
+        # Deferred recognition (for fast-moving persons who leave the frame)
+        self._deferred_queue: queue.Queue = queue.Queue(maxsize=50)
+        self._deferred_results: Dict[int, str] = {}  # track_id -> result message
+        self._deferred_stop = threading.Event()
+        if settings.enable_deferred_recognition:
+            self._deferred_thread = threading.Thread(target=self._deferred_worker, daemon=True,
+                                                     name="deferred-recognition")
+            self._deferred_thread.start()
+
     # ------------------------------------------------------------------ main
     def process(self, frame: np.ndarray) -> Tuple[np.ndarray, Dict]:
         t_start = time.perf_counter()
@@ -100,6 +120,15 @@ class GatePipeline:
         self.tracker.predict()
 
         new_events: List[str] = []
+
+        # Check for deferred recognition results
+        if self.s.enable_deferred_recognition:
+            for track_id in list(self._deferred_results.keys()):
+                msg = self._deferred_results.pop(track_id)
+                new_events.append(msg)
+                self.events.appendleft(msg)
+                self.session_logged += 1
+
         ran_detect = (self.frame_idx - 1) % self.detect_every == 0
         if ran_detect:
             t0 = time.perf_counter()
@@ -140,7 +169,78 @@ class GatePipeline:
         return self._draw(frame.copy(), visible, info), info
 
     def close(self) -> None:
-        """Nothing is held open (DB connections are per-call); kept for a symmetric API."""
+        """Stop deferred worker and clean up resources."""
+        if self.s.enable_deferred_recognition:
+            self._deferred_stop.set()
+            self._deferred_queue.put(None)  # wake up the worker
+            self._deferred_thread.join(timeout=2.0)
+
+    # -------------------------------------------------------------- deferred recognition
+    def _on_track_lost(self, track: Track) -> None:
+        """Called when a track is about to be removed from the tracker."""
+        if not track.ident or track.ident.status != "pending":
+            return
+        # Only queue if we have some embeddings to work with
+        if len(track.ident.embs) >= self.s.deferred_min_embeddings:
+            try:
+                self._deferred_queue.put_nowait((track.id, track.ident, track.last_direction))
+            except queue.Full:
+                pass  # Queue full, drop this one
+
+    def _deferred_worker(self) -> None:
+        """Background thread that processes tracks that left the frame while pending."""
+        while not self._deferred_stop.is_set():
+            try:
+                item = self._deferred_queue.get(timeout=0.5)
+                if item is None:  # Shutdown signal
+                    break
+                track_id, ident, direction = item
+
+                # Process buffered frame crops if available
+                if ident.frame_crops:
+                    for crop, quality in ident.frame_crops:
+                        try:
+                            # Re-embed from buffered crops
+                            emb = self.engine.embed_aligned(crop)
+                            ident.embs.append(emb)
+                            ident.quals.append(quality)
+
+                            single = self.gallery.match(emb)
+                            single_ok = Gallery.accept(single, self.s.similarity_threshold,
+                                                      self.s.similarity_margin)
+                            ident.votes.append(single.student.id if single_ok else -1)
+                        except Exception:
+                            continue
+
+                # Aggregate and try to identify
+                if len(ident.embs) >= self.s.min_votes:
+                    agg = l2_normalize(sum(q * e for q, e in zip(ident.quals, ident.embs)))
+                    m = self.gallery.match(agg)
+                    if Gallery.accept(m, self.s.similarity_threshold, self.s.similarity_margin):
+                        agree = sum(1 for v in ident.votes if v == m.student.id) / len(ident.votes)
+                        if agree >= 0.5:
+                            ident.status = "identified"
+                            ident.student, ident.similarity = m.student, m.similarity
+
+                            # Try to log attendance
+                            if self.log_attendance:
+                                logged = self._log_deferred(ident, direction or self.s.default_direction)
+                                if logged:
+                                    msg = (f"{time.strftime('%H:%M:%S')} [DEFERRED] {ident.student.name} "
+                                          f"({ident.student.roll_number}) - identified after leaving frame")
+                                    self._deferred_results[track_id] = msg
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                # Silently continue on errors in background thread
+                pass
+
+    def _log_deferred(self, ident: Identity, direction: str) -> bool:
+        """Log attendance for deferred identification (no snapshots available)."""
+        if not self.log_attendance or not ident.student:
+            return False
+        return self.logger.maybe_log(ident.student, ident.similarity, direction)
 
     # -------------------------------------------------------------- internals
     def _ema(self, attr: str, value: float, alpha: float = 0.1) -> None:
@@ -171,8 +271,8 @@ class GatePipeline:
             tr.last_direction = "ENTRY" if (side > 0) == positive_is_entry else "EXIT"
         tr.gate_side = side
 
-    def _quality_sample(self, det: Detection, frame: np.ndarray, ident: Identity):
-        """Return (aligned_crop, quality) if this detection is good enough to embed, else None."""
+    def _quality_sample(self, det: Detection, frame: np.ndarray, ident: Identity, bbox: np.ndarray):
+        """Return (aligned_crop, quality, person_crop) if this detection is good enough to embed, else None."""
         s = self.s
         if det.kps is None:
             ident.hint = "no landmarks"; return None
@@ -199,7 +299,15 @@ class GatePipeline:
             return None
         ident.hint = ""
         quality = float(np.clip(blur / 150.0, 0.1, 1.0) * ps)
-        return aligned, quality
+
+        # Extract person crop from bounding box
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        person_crop = frame[y1:y2, x1:x2].copy()
+
+        return aligned, quality, person_crop
 
     def _recognize(self, tr: Track, frame: np.ndarray) -> Optional[str]:
         s = self.s
@@ -221,15 +329,24 @@ class GatePipeline:
         # ---- pending: collect a quality keyframe
         if self.frame_idx - ident.last_rec_frame < s.rec_interval_frames:
             return None
-        sample = self._quality_sample(tr.last_det, frame, ident)
+        sample = self._quality_sample(tr.last_det, frame, ident, tr.bbox)
         if ident.status == "spoof":
             ident.unknown_since = self.frame_idx
             return None
         if sample is None:
             return None
-        aligned, quality = sample
+        aligned, quality, person_crop = sample
         ident.last_rec_frame = self.frame_idx
         emb = self.engine.embed_aligned(aligned)
+
+        # Buffer crops for deferred recognition
+        if s.enable_deferred_recognition and len(ident.frame_crops) < s.buffer_crops_for_deferred:
+            ident.frame_crops.append((aligned.copy(), quality))
+
+        # Keep track of best crops for snapshots
+        if ident.best_aligned_face is None or quality > max(ident.quals, default=0):
+            ident.best_aligned_face = aligned.copy()
+            ident.best_person_crop = person_crop.copy()
 
         ident.embs.append(emb)
         ident.quals.append(quality)
@@ -262,7 +379,7 @@ class GatePipeline:
         """Re-embed an identified track; two consecutive disagreements reset it (guards ID swaps)."""
         s, ident = self.s, tr.ident
         ident.last_verify_frame = self.frame_idx
-        sample = self._quality_sample(tr.last_det, frame, ident)
+        sample = self._quality_sample(tr.last_det, frame, ident, tr.bbox)
         if sample is None:
             return
         m = self.gallery.match(self.engine.embed_aligned(sample[0]))
@@ -290,7 +407,24 @@ class GatePipeline:
         if s.gate_line_enabled and s.require_gate_crossing and tr.last_direction is None:
             return None                                        # waiting for the line to be crossed
         direction = tr.last_direction or s.default_direction
-        if self.logger.maybe_log(ident.student, ident.similarity, direction):
+
+        # Save snapshots if enabled
+        face_snapshot_path = None
+        person_snapshot_path = None
+        if s.save_snapshots and ident.best_aligned_face is not None:
+            now = datetime.now()
+            try:
+                face_snapshot_path = save_snapshot(ident.best_aligned_face, ident.student.roll_number,
+                                                  now, kind="face")
+                if ident.best_person_crop is not None:
+                    person_snapshot_path = save_snapshot(ident.best_person_crop, ident.student.roll_number,
+                                                        now, kind="person")
+            except Exception as e:
+                # Don't fail attendance logging if snapshot save fails
+                pass
+
+        if self.logger.maybe_log(ident.student, ident.similarity, direction,
+                                face_snapshot=face_snapshot_path, person_snapshot=person_snapshot_path):
             msg = (f"{time.strftime('%H:%M:%S')}  {ident.student.name} "
                    f"({ident.student.roll_number}) - {direction}")
             self.events.appendleft(msg)

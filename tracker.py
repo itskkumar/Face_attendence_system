@@ -154,11 +154,52 @@ class Track:
         self.last_det = det
         self.history.append(self.center)
 
+    def mahalanobis_distance(self, bbox: np.ndarray) -> float:
+        """
+        Compute Mahalanobis distance from track's predicted state to a detection bbox.
+
+        This measures how statistically unlikely the detection is given the Kalman filter's
+        prediction and uncertainty. Lower values indicate better kinematic consistency.
+
+        Args:
+            bbox: (4,) xyxy detection bounding box
+
+        Returns:
+            Mahalanobis distance (float), sqrt(y^T @ inv(S) @ y)
+        """
+        # Measurement vector from detection
+        z = xyxy_to_xyah(bbox)
+
+        # Project state to measurement space
+        H = self.kf._H
+        x = self.mean
+        P = self.cov
+
+        # Innovation residual: y = z - H @ x
+        y = z - (H @ x)
+
+        # Measurement noise covariance
+        h = max(float(x[3]), 1.0)
+        std = [self.kf._w_pos * h, self.kf._w_pos * h, 1e-1, self.kf._w_pos * h]
+        R = np.diag(np.square(std))
+
+        # Innovation covariance: S = H @ P @ H.T + R
+        S = H @ P @ H.T + R
+
+        # Mahalanobis distance: sqrt(y^T @ inv(S) @ y)
+        try:
+            S_inv = np.linalg.inv(S)
+            mahal_squared = float(y.T @ S_inv @ y)
+            return float(np.sqrt(max(0.0, mahal_squared)))
+        except np.linalg.LinAlgError:
+            # Singular matrix, return large distance
+            return 1e6
+
 
 class ByteTrackLite:
     def __init__(self, high_thresh=0.5, low_thresh=0.1, new_thresh=0.6, match_thresh=0.8,
                  low_match_thresh=0.5, max_age=30, min_hits=2, tentative_max_age=4,
-                 gating_thresh=13.28):
+                 gating_thresh=13.28, on_track_lost=None):
         self.high_thresh, self.low_thresh, self.new_thresh = high_thresh, low_thresh, new_thresh
         self.match_thresh, self.low_match_thresh = match_thresh, low_match_thresh
         self.max_age, self.min_hits, self.tentative_max_age = max_age, min_hits, tentative_max_age
@@ -167,23 +208,45 @@ class ByteTrackLite:
         self.tracks: List[Track] = []
         self._ids = itertools.count(1)
         self.frame_idx = 0
+        self.on_track_lost = on_track_lost        # callback for when a track is about to be removed
 
     def predict(self) -> None:
         self.frame_idx += 1
         for t in self.tracks:
             t.predict()
 
-    def _associate(self, tracks: List[Track], dets: List[Detection], thresh: float, gate: bool):
+    def _associate(self, tracks: List[Track], dets: List[Detection], thresh: float, gate: bool, use_hybrid_cost: bool = False):
         if not tracks or not dets:
             return [], list(range(len(tracks))), list(range(len(dets)))
         tb = np.array([t.bbox for t in tracks])
         db = np.array([d.bbox for d in dets])
-        cost = 1.0 - iou_matrix(tb, db)
+
+        # Base IoU cost matrix
+        iou_mat = iou_matrix(tb, db)
+        cost = 1.0 - iou_mat
+
+        # Hybrid cost for Stage-1: blend IoU with Mahalanobis distance
+        if use_hybrid_cost:
+            # Compute Mahalanobis distance matrix
+            mahal_mat = np.zeros((len(tracks), len(dets)), dtype=np.float64)
+            for i, t in enumerate(tracks):
+                for j in range(len(dets)):
+                    mahal_mat[i, j] = t.mahalanobis_distance(db[j])
+
+            # Normalize Mahalanobis distances to [0, 1] range
+            # Chi-square 99% threshold for 4 DoF is ~13.28
+            mahal_normalized = np.clip(mahal_mat / 13.28, 0.0, 1.0)
+
+            # Blend: 75% IoU + 25% Mahalanobis
+            cost = 0.75 * cost + 0.25 * mahal_normalized
+
+        # Mahalanobis gating (existing)
         if gate:
             meas = np.array([xyxy_to_xyah(b) for b in db])
             for i, t in enumerate(tracks):
                 g = self.kf.gating_distance(t.mean, t.cov, meas)
                 cost[i, g > self.gating_thresh] = _BIG
+
         cost = np.where(cost > thresh, _BIG, cost)
         rows, cols = linear_sum_assignment(cost)
         matches, ut, ud = [], set(range(len(tracks))), set(range(len(dets)))
@@ -197,12 +260,14 @@ class ByteTrackLite:
         high = [d for d in detections if d.score >= self.high_thresh]
         low = [d for d in detections if self.low_thresh <= d.score < self.high_thresh]
 
-        m1, unmatched_tracks, unmatched_high = self._associate(self.tracks, high, self.match_thresh, True)
+        # Stage-1: High-confidence detections with hybrid IoU + Mahalanobis cost
+        m1, unmatched_tracks, unmatched_high = self._associate(self.tracks, high, self.match_thresh, True, use_hybrid_cost=True)
         for ti, di in m1:
             self.tracks[ti].update(high[di])
 
+        # Stage-2: Low-confidence occlusion recovery with pure IoU (keep existing behavior)
         remaining = [self.tracks[i] for i in unmatched_tracks if self.tracks[i].confirmed]
-        m2, _, _ = self._associate(remaining, low, self.low_match_thresh, False)
+        m2, _, _ = self._associate(remaining, low, self.low_match_thresh, False, use_hybrid_cost=False)
         for ti, di in m2:
             remaining[ti].update(low[di])
 
@@ -213,6 +278,17 @@ class ByteTrackLite:
         for t in self.tracks:
             if t.hits >= self.min_hits:
                 t.confirmed = True
+
+        # Call the callback for tracks about to be removed
+        if self.on_track_lost:
+            lost_tracks = [
+                t for t in self.tracks
+                if (t.time_since_update > self.max_age
+                    or (not t.confirmed and t.time_since_update > self.tentative_max_age))
+            ]
+            for t in lost_tracks:
+                self.on_track_lost(t)
+
         self.tracks = [
             t for t in self.tracks
             if not (t.time_since_update > self.max_age

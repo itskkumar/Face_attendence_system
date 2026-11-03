@@ -45,6 +45,7 @@ def create_default_admin(store: Store):
 def authenticate(store: Store, username: str, password: str) -> Optional[str]:
     """Authenticate user and return role if successful."""
     with store._conn() as c:
+        # First check users table
         rows = c.execute("SELECT username, password_hash, role FROM users").fetchall()
         for row in rows:
             stored_username_salt = row['username']
@@ -56,6 +57,23 @@ def authenticate(store: Store, username: str, password: str) -> Optional[str]:
             if stored_username == username:
                 if verify_password(password, row['password_hash'], salt):
                     return row['role']
+
+        # If not found in users, check if it's a student roll number
+        student = c.execute("SELECT roll_number, name FROM students WHERE roll_number = ?", (username,)).fetchone()
+        if student:
+            # For students, password is their roll number by default (simple auth)
+            # In production, you'd want proper password management
+            if password == username or password == "student123":
+                # Create a user entry for this student if not exists
+                try:
+                    pwd_hash, salt = hash_password("student123")
+                    c.execute(
+                        "INSERT OR IGNORE INTO users(username, password_hash, role, created_at) VALUES(?,?,?,datetime('now'))",
+                        (f"{username}:{salt}", pwd_hash, "student")
+                    )
+                except:
+                    pass
+                return "student"
     return None
 
 

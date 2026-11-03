@@ -9,9 +9,8 @@ Design notes
   * log_attendance() does the cooldown check and the INSERT inside one
     BEGIN IMMEDIATE transaction, so two processes can never both log the same
     person inside the cooldown window.
-  * Gallery matching is one NumPy matrix-vector product. At college scale
-    (hundreds to a few thousand templates) that takes well under a millisecond,
-    so an ANN index such as FAISS-HNSW would add complexity without benefit.
+  * Gallery matching: FAISS HNSW O(log N) graph-based ANN if available,
+    otherwise falls back to exact NumPy matrix-vector product.
 """
 from __future__ import annotations
 
@@ -23,8 +22,16 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from config import DATE_FMT, DB_PATH
+from config import DATE_FMT, DB_PATH, DEFAULT_SETTINGS
 from vision_math import l2_normalize
+
+# Try to import FAISS, fallback to NumPy if unavailable
+try:
+    import faiss
+    FAISS_AVAILABLE = True
+except ImportError:
+    FAISS_AVAILABLE = False
+    faiss = None
 
 EMB_DIM = 512
 MAX_TEMPLATES_PER_STUDENT = 20
@@ -59,7 +66,9 @@ CREATE TABLE IF NOT EXISTS attendance_logs (
     direction   TEXT NOT NULL DEFAULT 'ENTRY',
     similarity  REAL,
     source      TEXT,
-    camera_label TEXT DEFAULT 'default'    -- multi-camera support
+    camera_label TEXT DEFAULT 'default',   -- multi-camera support
+    face_snapshot TEXT,                    -- relative path to 112x112 aligned face crop
+    person_snapshot TEXT                   -- relative path to bounding-box person crop
 );
 CREATE INDEX IF NOT EXISTS idx_logs_ts   ON attendance_logs(timestamp);
 CREATE INDEX IF NOT EXISTS idx_logs_roll ON attendance_logs(roll_number, timestamp);
@@ -125,11 +134,43 @@ class Gallery:
     """Immutable snapshot of every enrolled template, ready for matrix matching."""
 
     def __init__(self, students: List[StudentInfo], matrix: np.ndarray,
-                 owners: np.ndarray, version: int):
+                 owners: np.ndarray, version: int, use_faiss: bool = False):
         self.students = students
         self.matrix = matrix            # (T, 512) float32, L2-normalised
         self.owners = owners            # (T,) index into `students`
         self.version = version
+        self.use_faiss = use_faiss and FAISS_AVAILABLE
+        self.faiss_index = None
+        self.search_method = "NumPy O(N)"
+
+        # Build FAISS HNSW index if enabled and available
+        if self.use_faiss and self.matrix.shape[0] > 0:
+            try:
+                self._build_faiss_index()
+                self.search_method = "FAISS HNSW O(log N)"
+            except Exception:
+                # Fallback to NumPy on any FAISS error
+                self.use_faiss = False
+                self.faiss_index = None
+                self.search_method = "NumPy O(N)"
+
+    def _build_faiss_index(self):
+        """Build FAISS HNSW index for O(log N) approximate nearest neighbor search."""
+        if not FAISS_AVAILABLE or self.matrix.shape[0] == 0:
+            return
+
+        settings = DEFAULT_SETTINGS
+        M = settings.faiss_hnsw_m
+        ef_construction = settings.faiss_ef_construction
+        ef_search = settings.faiss_ef_search
+
+        # Create HNSW index with inner product (equivalent to cosine similarity for L2-normalized vectors)
+        self.faiss_index = faiss.IndexHNSWFlat(EMB_DIM, M, faiss.METRIC_INNER_PRODUCT)
+        self.faiss_index.hnsw.efConstruction = ef_construction
+        self.faiss_index.hnsw.efSearch = ef_search
+
+        # Add all embeddings to the index
+        self.faiss_index.add(self.matrix)
 
     @property
     def size(self) -> int:
@@ -138,10 +179,29 @@ class Gallery:
     def match(self, emb: np.ndarray) -> Optional[GalleryMatch]:
         if self.matrix.shape[0] == 0:
             return None
-        q = l2_normalize(emb)
-        sims = self.matrix @ q                                  # cosine similarities
-        per_student = np.full(len(self.students), -1.0, dtype=np.float32)
-        np.maximum.at(per_student, self.owners, sims)           # best template per student
+
+        q = l2_normalize(emb).reshape(1, -1).astype(np.float32)
+
+        # Use FAISS if available, otherwise fallback to NumPy
+        if self.use_faiss and self.faiss_index is not None:
+            # FAISS search returns (distances, indices)
+            # Since we use METRIC_INNER_PRODUCT with L2-normalized vectors, distances are cosine similarities
+            similarities, indices = self.faiss_index.search(q, min(self.matrix.shape[0], 100))
+            sims = similarities[0]
+            template_indices = indices[0]
+
+            # Map template indices to student indices and find best per student
+            per_student = np.full(len(self.students), -1.0, dtype=np.float32)
+            for sim, tidx in zip(sims, template_indices):
+                if tidx >= 0 and tidx < len(self.owners):
+                    student_idx = self.owners[tidx]
+                    per_student[student_idx] = max(per_student[student_idx], float(sim))
+        else:
+            # NumPy exact search (original implementation)
+            sims = self.matrix @ q.ravel()
+            per_student = np.full(len(self.students), -1.0, dtype=np.float32)
+            np.maximum.at(per_student, self.owners, sims)
+
         order = np.argsort(per_student)[::-1]
         best = float(per_student[order[0]])
         second = float(per_student[order[1]]) if len(order) > 1 else 0.0
@@ -208,9 +268,14 @@ class Store:
                 vecs.append(_unblob(r["embedding"])); owners.append(index[r["student_id"]])
         matrix = (l2_normalize(np.vstack(vecs)) if vecs
                   else np.zeros((0, EMB_DIM), dtype=np.float32))
+
+        # Enable FAISS if configured and available
+        use_faiss = DEFAULT_SETTINGS.enable_faiss_hnsw and FAISS_AVAILABLE
+
         return Gallery(students, matrix.astype(np.float32),
                        np.asarray(owners, dtype=np.int64),
-                       int(version_row["value"]) if version_row else 0)
+                       int(version_row["value"]) if version_row else 0,
+                       use_faiss=use_faiss)
 
     def add_student(self, roll_number: str, name: str, embeddings: Sequence[np.ndarray],
                     qualities: Optional[Sequence[float]] = None, mode: str = "replace",
@@ -284,10 +349,16 @@ class Store:
     def log_attendance(self, roll_number: str, name: str, student_id: Optional[int],
                        similarity: float, direction: str, source: str,
                        cooldown_seconds: int, now: Optional[datetime] = None,
-                       camera_label: str = "default") -> Tuple[bool, Optional[datetime]]:
+                       camera_label: str = "default",
+                       face_snapshot: Optional[str] = None,
+                       person_snapshot: Optional[str] = None) -> Tuple[bool, Optional[datetime]]:
         """
         Insert a log row unless this person was already logged within the cooldown.
         Returns (logged, last_logged_time). Atomic across threads and processes.
+
+        Args:
+            face_snapshot: Relative path to aligned face crop (from DATA_DIR)
+            person_snapshot: Relative path to bounding-box person crop (from DATA_DIR)
         """
         now = now or _now()
         with self._tx(immediate=True) as c:
@@ -297,9 +368,9 @@ class Store:
             if last is not None and (now - last).total_seconds() < cooldown_seconds:
                 return False, last
             c.execute(
-                "INSERT INTO attendance_logs(student_id, roll_number, name, timestamp, direction, similarity, source, camera_label) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (student_id, roll_number, name, _ts(now), direction, float(similarity), source, camera_label))
+                "INSERT INTO attendance_logs(student_id, roll_number, name, timestamp, direction, similarity, source, camera_label, face_snapshot, person_snapshot) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (student_id, roll_number, name, _ts(now), direction, float(similarity), source, camera_label, face_snapshot, person_snapshot))
         return True, now
 
     def last_seen_since(self, seconds: int, now: Optional[datetime] = None) -> Dict[str, datetime]:

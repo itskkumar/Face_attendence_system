@@ -1,5 +1,5 @@
 import numpy as np
-from tracker import ByteTrackLite, Detection, KalmanFilterXYAH, iou_matrix, xyah_to_xyxy, xyxy_to_xyah
+from tracker import ByteTrackLite, Detection, KalmanFilterXYAH, Track, iou_matrix, xyah_to_xyxy, xyxy_to_xyah
 
 
 def box(cx, cy, w=80, h=100):
@@ -35,6 +35,55 @@ def test_gating_distance_separates_near_and_far():
     near = xyxy_to_xyah(box(103, 101)); far = xyxy_to_xyah(box(400, 300))
     d = kf.gating_distance(mean, cov, np.array([near, far]))
     assert d[0] < 13.28 < d[1]
+
+
+def test_mahalanobis_distance_returns_nonnegative():
+    """Mahalanobis distance returns non-negative values."""
+    kf = KalmanFilterXYAH()
+    det = Detection(bbox=box(100, 100), kps=None, score=0.9)
+    track = Track(1, det, kf, frame_idx=0)
+
+    # Same bbox should give low distance
+    dist_same = track.mahalanobis_distance(det.bbox)
+    assert dist_same >= 0.0
+    assert dist_same < 5.0, f"Same bbox distance {dist_same} should be < 5.0"
+
+
+def test_mahalanobis_distance_increases_with_separation():
+    """Mahalanobis distance increases as bboxes move apart."""
+    kf = KalmanFilterXYAH()
+    det = Detection(bbox=box(100, 100), kps=None, score=0.9)
+    track = Track(1, det, kf, frame_idx=0)
+
+    # Same position
+    dist_same = track.mahalanobis_distance(box(100, 100))
+
+    # Near position
+    dist_near = track.mahalanobis_distance(box(110, 105))
+
+    # Far position
+    dist_far = track.mahalanobis_distance(box(500, 500))
+
+    assert dist_same < dist_near < dist_far
+
+
+def test_hybrid_cost_associates_correctly():
+    """Hybrid cost matrix with Mahalanobis + IoU works for association."""
+    tracker = ByteTrackLite()
+
+    # Create initial detection and track
+    det1 = Detection(bbox=box(100, 100), kps=None, score=0.9)
+    tracker.tracks.append(Track(1, det1, tracker.kf, frame_idx=0))
+
+    # Next frame: detection moves slightly
+    tracker.predict()
+    det2 = Detection(bbox=box(105, 102), kps=None, score=0.9)
+
+    # Associate with hybrid cost (Stage-1 high-confidence)
+    tracks = tracker.update([det2])
+
+    assert len(tracks) == 1
+    assert tracks[0].id == 1  # Same track ID, correctly associated
 
 
 def _run(trajs, frames=80, drop=0.0, seed=0, low_score_every=None):

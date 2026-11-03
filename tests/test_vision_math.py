@@ -1,5 +1,5 @@
 import cv2, numpy as np, pytest
-from vision_math import (ARCFACE_REF, align_face, fft_moire_score, l2_normalize,
+from vision_math import (ARCFACE_REF, align_face, compute_fft_liveness, fft_moire_score, l2_normalize,
                          laplacian_variance, pose_score, umeyama_similarity)
 
 
@@ -76,3 +76,32 @@ def test_l2_normalize():
 def test_fft_score_in_range():
     img = np.random.default_rng(2).integers(0, 255, (112, 112, 3), dtype=np.uint8)
     assert 0.0 <= fft_moire_score(img) <= 1.0
+
+
+def test_compute_fft_liveness_output_range():
+    """FFT liveness score must be in [0, 1] range."""
+    rng = np.random.default_rng(42)
+    aligned = rng.integers(0, 255, (112, 112, 3), dtype=np.uint8)
+    score, spectrum = compute_fft_liveness(aligned)
+    assert 0.0 <= score <= 1.0, f"Liveness score {score} out of [0, 1] range"
+    assert spectrum.shape == (112, 112, 3), f"Spectrum shape {spectrum.shape} != (112, 112, 3)"
+    assert spectrum.dtype == np.uint8, f"Spectrum dtype {spectrum.dtype} != uint8"
+
+
+def test_compute_fft_liveness_spectrum_colormap():
+    """Spectrum visualization should be valid uint8 image."""
+    rng = np.random.default_rng(1)
+    aligned = rng.integers(0, 255, (112, 112, 3), dtype=np.uint8)
+    _, spectrum = compute_fft_liveness(aligned)
+    assert spectrum.min() >= 0 and spectrum.max() <= 255
+    assert spectrum.shape == (112, 112, 3)
+
+
+def test_compute_fft_liveness_grayscale_input():
+    """FFT liveness should handle grayscale input."""
+    rng = np.random.default_rng(3)
+    gray = rng.integers(0, 255, (112, 112), dtype=np.uint8)
+    score, spectrum = compute_fft_liveness(gray)
+    assert 0.0 <= score <= 1.0
+    assert spectrum.shape == (112, 112, 3)
+

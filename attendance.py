@@ -32,13 +32,15 @@ class AttendanceLogger:
             last = self.last_seen_dict.get(roll_number)
         return last is not None and (self.clock() - last).total_seconds() < self.cooldown_seconds
 
-    def maybe_log(self, student: StudentInfo, similarity: float, direction: str) -> bool:
+    def maybe_log(self, student: StudentInfo, similarity: float, direction: str,
+                  face_snapshot: Optional[str] = None, person_snapshot: Optional[str] = None) -> bool:
         """Log the student unless they are inside the cooldown window. True if a row was written."""
         if self.in_cooldown(student.roll_number):
             return False
         logged, last = self.store.log_attendance(
             student.roll_number, student.name, student.id, similarity, direction,
-            self.source, self.cooldown_seconds, now=self.clock(), camera_label=self.camera_label)
+            self.source, self.cooldown_seconds, now=self.clock(), camera_label=self.camera_label,
+            face_snapshot=face_snapshot, person_snapshot=person_snapshot)
         if last is not None:
             with self._lock:
                 self.last_seen_dict[student.roll_number] = last
