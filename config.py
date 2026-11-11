@@ -28,6 +28,10 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.environ.get("ATTENDANCE_DB", os.path.join(DATA_DIR, "attendance_system.db"))
 PROVIDER_CACHE_PATH = os.path.join(DATA_DIR, "provider_choice.json")
 
+# Anti-spoofing model path
+ANTISPOOFING_MODEL_DIR = os.path.join(DATA_DIR, "models", "antispoofing")
+MINIFAS_ONNX_PATH = os.path.join(ANTISPOOFING_MODEL_DIR, "minifas_v2.onnx")
+
 # --- Video sources ------------------------------------------------------------
 # Placeholder RTSP URL - replace with your gate camera, or pass --url on the CLI.
 RTSP_URL = "rtsp://username:password@192.168.1.100:554/stream1"
@@ -90,8 +94,18 @@ class Settings:
     gate_entry_direction: str = "down"          # down|up|right|left = which way counts as ENTRY
     require_gate_crossing: bool = False         # True: log only after the line is crossed
 
-    # ---- Liveness (EXPERIMENTAL, off by default) ----------------------------
-    liveness_mode: str = "off"                  # off | fft_experimental
+    # ---- Liveness Detection -------------------------------------------------
+    # Options: "off" | "fft_experimental" | "minifas"
+    # - "off": No liveness detection (default for backward compatibility)
+    # - "fft_experimental": Basic FFT heuristic (unreliable, kept for comparison)
+    # - "minifas": Pre-trained MiniFASNet ONNX model (recommended, ~95% accuracy)
+    liveness_mode: str = "off"
+
+    # MiniFASNet settings (when liveness_mode="minifas")
+    minifas_threshold: float = 0.50             # Reject if spoof_prob > this (0.5 = balanced)
+    minifas_input_size: int = 128               # Model expects 128x128 RGB input
+
+    # FFT settings (when liveness_mode="fft_experimental", legacy)
     liveness_min_score: float = 0.35
     enable_fft_liveness: bool = True            # Enable 2D FFT frequency-domain anti-spoofing
     min_fft_liveness_score: float = 0.48        # Minimum FFT liveness score to pass gate
