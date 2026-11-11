@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "description": "Pretrained MiniFASNet presentation-attack-detection models (Silent-Face-Anti-Spoofing). Weights are NOT bundled: run tools/convert_minifas.py (needs torch, separate venv) which writes the .onnx files and fills in sha256 below. Until sha256 values are pinned and the files validate, PAD reports NOT_CONFIGURED / ERROR.",
+  "source_repo": "https://github.com/minivision-ai/Silent-Face-Anti-Spoofing",
+  "license": "Apache-2.0 (believed; NOT verified in the authoring session - confirm LICENSE in the source repo before deployment)",
+  "ensemble": "mean of the per-model softmax 'real' probabilities (the official project sums the softmax vectors; the mean is the same ordering)",
+  "models": [
+    {
+      "file": "2.7_80x80_MiniFASNetV2.onnx",
+      "sha256": null,
+      "source_url": "https://github.com/minivision-ai/Silent-Face-Anti-Spoofing/tree/master/resources/anti_spoof_models (2.7_80x80_MiniFASNetV2.pth)",
+      "architecture": "MiniFASNetV2",
+      "crop_scale": 2.7,
+      "input": {"size": [80, 80], "color_order": "BGR", "scaling": "none: float32 values 0..255, not divided by 255", "layout": "NCHW", "batch": 1},
+      "output": {"classes": 3, "activation": "softmax (added by tools/convert_minifas.py when exporting)", "real_index": 1}
+    },
+    {
+      "file": "4_0_0_80x80_MiniFASNetV1SE.onnx",
+      "sha256": null,
+      "source_url": "https://github.com/minivision-ai/Silent-Face-Anti-Spoofing/tree/master/resources/anti_spoof_models (4_0_0_80x80_MiniFASNetV1SE.pth)",
+      "architecture": "MiniFASNetV1SE",
+      "crop_scale": 4.0,
+      "input": {"size": [80, 80], "color_order": "BGR", "scaling": "none: float32 values 0..255, not divided by 255", "layout": "NCHW", "batch": 1},
+      "output": {"classes": 3, "activation": "softmax (added by tools/convert_minifas.py when exporting)", "real_index": 1}
+    }
+  ],
+  "verification_status": "preprocessing and class order recorded from the official source as remembered by the author; re-verify against anti_spoof_predict.py / generate_patches.py / utility.py when installing weights"
+}

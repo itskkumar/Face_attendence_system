@@ -131,5 +131,14 @@ def migrate_database():
     finally:
         conn.close()
 
-if __name__ == "__main__":
+def migrate_all():
     migrate_database()
+    # PAD upgrade (additive): pad_events table + attendance_logs.pad_state / pad_score. Backs up first.
+    from pad_store import migrate_pad_schema
+    backup = migrate_pad_schema(DB_PATH)
+    if backup:
+        print(f"PAD schema migrated (backup: {backup})")
+
+
+if __name__ == "__main__":
+    migrate_all()

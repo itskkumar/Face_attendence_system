@@ -18,18 +18,23 @@ Per frame
 """
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
 import unicodedata
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
+import antispoof
+import pad_store
+from antispoof import PADProvider
 from attendance import AttendanceLogger
 from config import Settings
 from database import Gallery, Store, StudentInfo
@@ -37,11 +42,15 @@ from snapshot_manager import save_snapshot
 from tracker import ByteTrackLite, Detection, Track
 from vision_math import align_face, compute_fft_liveness, fft_moire_score, l2_normalize, laplacian_variance, pose_score
 
+log = logging.getLogger("pipeline")
+
 GREEN = (113, 204, 46)     # BGR
 RED = (60, 60, 230)
 AMBER = (0, 190, 255)
 DARK = (20, 20, 20)
 WHITE = (255, 255, 255)
+GREY = (170, 170, 170)
+PURPLE = (200, 90, 170)
 
 
 def ascii_safe(text: str) -> str:
@@ -71,12 +80,27 @@ class Identity:
     frame_crops: Deque[Tuple[np.ndarray, float]] = field(default_factory=lambda: deque(maxlen=5))  # (BGR crop, quality)
     best_aligned_face: Optional[np.ndarray] = None          # 112x112 aligned face for snapshot
     best_person_crop: Optional[np.ndarray] = None           # bounding box crop for snapshot
+    # PAD (additive; only used when liveness_mode == "minifas")
+    pad_obs: Deque[float] = field(default_factory=lambda: deque(maxlen=5))   # real-probabilities
+    pad_state: str = antispoof.UNCERTAIN
+    pad_real_mean: float = 0.0
+    pad_last_spoof_prob: Optional[float] = None
+    pad_last_frame: int = -10 ** 9
+    pad_started_at: Optional[float] = None                  # monotonic time of the first observation
+    pad_flagged_uncertain: bool = False
+    pad_reason: str = ""
+    pad_ms: float = 0.0
+    pad_reject_reported: str = ""                          # last PAD state already reported as rejected
+    pad_track_id: int = -1
+    logged: bool = False                                    # attendance row written for this track
 
 
 class GatePipeline:
     def __init__(self, engine, store: Store, settings: Settings, *, source_label: str = "live",
                  is_file: bool = False, logger: Optional[AttendanceLogger] = None,
-                 log_attendance: bool = True, camera_label: str = "default"):
+                 log_attendance: bool = True, camera_label: str = "default",
+                 pad: Optional[PADProvider] = None,
+                 event_sink: Optional[Callable[[dict], None]] = None):
         self.engine = engine
         self.store = store
         self.s = settings
@@ -102,6 +126,16 @@ class GatePipeline:
         self._last_call = None
         self.events: Deque[str] = deque(maxlen=12)
         self.session_logged = 0
+
+        # Anti-spoofing (additive). `pad` is shared by the caller (one session per process).
+        self.event_sink = event_sink
+        self.pad_ms = 0.0
+        self._pad_mode = settings.liveness_mode == "minifas"
+        self.pad: Optional[PADProvider] = None
+        if self._pad_mode:
+            self.pad = pad if pad is not None else antispoof.NullPAD("no PAD provider supplied")
+            with store._conn() as _c:
+                pad_store.ensure_pad_schema(_c)
 
         # Deferred recognition (for fast-moving persons who leave the frame)
         self._deferred_queue: queue.Queue = queue.Queue(maxsize=50)
@@ -165,6 +199,8 @@ class GatePipeline:
             "ran_detect": ran_detect, "faces": len(visible), "identified": identified,
             "unknown": unknown, "new_events": new_events, "session_logged": self.session_logged,
             "provider": getattr(self.engine, "provider_label", "?"),
+            "liveness_mode": self.s.liveness_mode, "pad_ms": self.pad_ms,
+            "tracks": self.track_details(visible),
         }
         return self._draw(frame.copy(), visible, info), info
 
@@ -179,6 +215,10 @@ class GatePipeline:
     def _on_track_lost(self, track: Track) -> None:
         """Called when a track is about to be removed from the tracker."""
         if not track.ident or track.ident.status != "pending":
+            return
+        if self._pad_mode and track.ident.pad_state != antispoof.LIVE:
+            # A track that never passed PAD must not be identified/logged after it leaves the frame.
+            self._emit("attendance.rejected", track.id, track.ident, reason="left frame without LIVE (deferred path blocked)")
             return
         # Only queue if we have some embeddings to work with
         if len(track.ident.embs) >= self.s.deferred_min_embeddings:
@@ -210,6 +250,7 @@ class GatePipeline:
                                                       self.s.similarity_margin)
                             ident.votes.append(single.student.id if single_ok else -1)
                         except Exception:
+                            log.exception("deferred recognition: could not embed a buffered crop")
                             continue
 
                 # Aggregate and try to identify
@@ -232,15 +273,20 @@ class GatePipeline:
 
             except queue.Empty:
                 continue
-            except Exception as e:
-                # Silently continue on errors in background thread
-                pass
+            except Exception:
+                log.exception("deferred recognition worker error")
 
     def _log_deferred(self, ident: Identity, direction: str) -> bool:
         """Log attendance for deferred identification (no snapshots available)."""
         if not self.log_attendance or not ident.student:
             return False
-        return self.logger.maybe_log(ident.student, ident.similarity, direction)
+        if self._pad_mode and ident.pad_state != antispoof.LIVE:
+            return False                                      # PAD gate: no attendance without LIVE
+        logged = self.logger.maybe_log(ident.student, ident.similarity, direction)
+        if logged:
+            ident.logged = True
+            self._after_logged(ident.pad_track_id, ident)
+        return logged
 
     # -------------------------------------------------------------- internals
     def _ema(self, attr: str, value: float, alpha: float = 0.1) -> None:
@@ -297,6 +343,10 @@ class GatePipeline:
             if ident.spoof_votes >= 3 and not ident.embs:
                 ident.status = "spoof"
             return None
+        if self._pad_mode:
+            self._pad_observe(det, frame, ident, bbox)
+            if ident.status == "spoof":
+                return None
         ident.hint = ""
         quality = float(np.clip(blur / 150.0, 0.1, 1.0) * ps)
 
@@ -313,6 +363,8 @@ class GatePipeline:
         s = self.s
         if tr.ident is None:
             tr.ident = Identity(last_verify_frame=self.frame_idx)
+            tr.ident.pad_track_id = tr.id
+            self._emit("face.detected", tr.id, tr.ident, det_score=float(tr.last_det.score))
         ident: Identity = tr.ident
 
         if ident.status in ("unknown", "spoof") and \
@@ -322,6 +374,9 @@ class GatePipeline:
         if ident.status == "identified":
             if self.frame_idx - ident.last_verify_frame >= s.reverify_interval_frames:
                 self._reverify(tr, frame)
+            elif self._pad_mode and ident.pad_state != antispoof.LIVE:
+                # identity locked but liveness not yet proven: keep collecting PAD observations
+                self._quality_sample(tr.last_det, frame, ident, tr.bbox)
             return self._try_log(tr) if ident.status == "identified" else None
         if ident.status in ("unknown", "spoof"):
             return None
@@ -368,11 +423,13 @@ class GatePipeline:
                 ident.mismatches = 0
                 ident.last_verify_frame = self.frame_idx
                 ident.hint = ""
+                self._emit("identity.verified", tr.id, ident, similarity=float(ident.similarity))
                 return self._try_log(tr)
         if ident.attempts >= s.max_attempts:
             ident.status = "unknown"
             ident.ever_unknown = True
             ident.unknown_since = self.frame_idx
+            self._emit("identity.unknown", tr.id, ident)
         return None
 
     def _reverify(self, tr: Track, frame: np.ndarray) -> None:
@@ -399,10 +456,21 @@ class GatePipeline:
         ident.mismatches = 0
         ident.spoof_votes = 0
         ident.hint = ""
+        ident.pad_obs.clear()                                 # PAD evidence never survives an identity reset
+        ident.pad_state = antispoof.UNCERTAIN
+        ident.pad_real_mean = 0.0
+        ident.pad_started_at = None
+        ident.pad_last_frame = -10 ** 9
+        ident.pad_flagged_uncertain = False
+        ident.pad_reject_reported = ""
+        ident.logged = False
 
     def _try_log(self, tr: Track) -> Optional[str]:
         s, ident = self.s, tr.ident
         if not self.log_attendance:
+            return None
+        if self._pad_mode and ident.pad_state != antispoof.LIVE:
+            self._pad_withhold(tr)                              # PAD gate: identity may lock, attendance may not
             return None
         if s.gate_line_enabled and s.require_gate_crossing and tr.last_direction is None:
             return None                                        # waiting for the line to be crossed
@@ -429,8 +497,149 @@ class GatePipeline:
                    f"({ident.student.roll_number}) - {direction}")
             self.events.appendleft(msg)
             self.session_logged += 1
+            ident.logged = True
+            self._after_logged(tr.id, ident)
             return msg
         return None
+
+    # ---------------------------------------------------------------- PAD / events (additive hooks)
+    def _emit(self, etype: str, track_id: int, ident: Identity, **extra) -> None:
+        """Typed event for the optional event_sink. Never carries embeddings."""
+        if self.event_sink is None:
+            return
+        ev = {"event_id": uuid.uuid4().hex, "type": etype, "ts": datetime.now().isoformat(timespec="milliseconds"),
+              "camera_id": self.camera_label, "track_id": int(track_id), "status": ident.status,
+              "pad_state": ident.pad_state if self._pad_mode else None,
+              "pad_real_prob": round(ident.pad_real_mean, 4) if self._pad_mode else None,
+              "liveness_mode": self.s.liveness_mode}
+        if ident.student is not None:
+            ev["student"] = {"roll_number": ident.student.roll_number, "name": ident.student.name}
+        ev.update(extra)
+        try:
+            self.event_sink(ev)
+        except Exception:
+            log.exception("event_sink raised")
+
+    def _after_logged(self, track_id: int, ident: Identity) -> None:
+        if self._pad_mode:
+            pad_store.annotate_attendance(self.store.path, ident.student.roll_number, ident.pad_state,
+                                          ident.pad_real_mean)
+        self._emit("attendance.recorded", track_id, ident, similarity=float(ident.similarity))
+
+    def _pad_withhold(self, tr: Track) -> None:
+        ident = tr.ident
+        if ident.pad_reject_reported == ident.pad_state:
+            return
+        ident.pad_reject_reported = ident.pad_state
+        policy = self.s.pad_unconfigured_policy
+        if ident.pad_state in (antispoof.NOT_CONFIGURED, antispoof.ERROR):
+            reason = f"PAD {ident.pad_state.lower()}: {ident.pad_reason}"
+            self._emit("attendance.rejected" if policy == "reject" else "review.required", tr.id, ident,
+                       reason=reason, policy=policy)
+        elif ident.pad_state == antispoof.SPOOF:
+            self._emit("attendance.rejected", tr.id, ident, reason="spoof")
+        else:
+            self._emit("attendance.rejected", tr.id, ident, reason="liveness not yet confirmed (will retry while the face is visible)")
+
+    def _pad_observe(self, det: Detection, frame: np.ndarray, ident: Identity, bbox: np.ndarray) -> None:
+        """Run PAD on this detection (candidate frames only), update the per-track decision."""
+        s = self.s
+        if self.frame_idx - ident.pad_last_frame < s.pad_observation_interval_frames:
+            return
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = [float(v) for v in det.bbox]
+        m = s.pad_edge_margin_px
+        if x1 <= m or y1 <= m or x2 >= w - 1 - m or y2 >= h - 1 - m:
+            ident.pad_reason = "face at frame edge"
+            return                                              # no observation: never counted as live
+        ident.pad_last_frame = self.frame_idx
+        if ident.pad_started_at is None:
+            ident.pad_started_at = time.monotonic()
+            self._emit("liveness.started", ident.pad_track_id, ident)
+        res = self.pad.observe(frame, det.bbox)
+        self._ema("pad_ms", res.latency_ms)
+        ident.pad_ms = res.latency_ms
+        if not res.valid:                                       # NOT_CONFIGURED / ERROR: no score, no LIVE
+            ident.pad_state, ident.pad_reason = res.state, res.reason
+            return
+        ident.pad_obs.append(res.real_prob)
+        prev = ident.pad_state
+        state, mean = antispoof.decide_pad(ident.pad_obs, min_obs=s.pad_min_obs,
+                                           real_threshold=s.pad_real_threshold,
+                                           spoof_threshold=s.pad_spoof_threshold)
+        ident.pad_state, ident.pad_real_mean, ident.pad_reason = state, mean, ""
+        ident.pad_last_spoof_prob = 1.0 - mean
+        tid = ident.pad_track_id
+        if state == antispoof.LIVE and prev != antispoof.LIVE:
+            self._pad_record(tid, ident, res)
+            self._emit("liveness.passed", tid, ident)
+        elif state == antispoof.SPOOF:
+            was_identified = ident.student is not None
+            if prev != antispoof.SPOOF:
+                self._pad_record(tid, ident, res, flagged=True,
+                                 note="spoof after identification" if was_identified else "spoof")
+                self._emit("liveness.failed", tid, ident, after_identification=was_identified)
+                if was_identified:
+                    try:
+                        self.store.log_audit("system", "pad_spoof_after_identification",
+                                             f"camera={self.camera_label} track={tid} "
+                                             f"student={ident.student.roll_number} real_mean={mean:.3f}")
+                    except Exception:
+                        log.exception("could not write PAD audit entry")
+            ident.status = "spoof"                              # stops further logging for this track
+            ident.unknown_since = self.frame_idx
+        elif state == antispoof.UNCERTAIN and not ident.pad_flagged_uncertain and ident.pad_started_at is not None \
+                and time.monotonic() - ident.pad_started_at > s.pad_max_observation_seconds:
+            ident.pad_flagged_uncertain = True
+            self._pad_record(tid, ident, res, flagged=True, note="review required: liveness not confirmed in time")
+            self._emit("liveness.uncertain", tid, ident)
+
+    def _pad_record(self, track_id: int, ident: Identity, res, flagged: bool = False, note: str = "") -> None:
+        pad_store.record_pad_event(
+            self.store.path, camera_label=self.camera_label, track_id=track_id, state=ident.pad_state,
+            real_prob=ident.pad_real_mean, spoof_prob=1.0 - ident.pad_real_mean, model_id=res.model_id,
+            student_id=ident.student.id if ident.student is not None else None, flagged=flagged, note=note)
+
+    def ui_status(self, tr: Track) -> str:
+        """Label for the UI (see the React live page)."""
+        ident = tr.ident
+        if ident is None:
+            return "DETECTED"
+        if ident.status == "spoof":
+            return "POSSIBLE SPOOF"
+        if ident.status == "unknown" or (ident.status == "pending" and ident.ever_unknown):
+            return "UNKNOWN"
+        if ident.status == "identified":
+            if self._pad_mode and ident.pad_state != antispoof.LIVE:
+                if ident.pad_state in (antispoof.NOT_CONFIGURED, antispoof.ERROR):
+                    return "PAD NOT CONFIGURED"
+                if ident.pad_flagged_uncertain:
+                    return "REVIEW REQUIRED"
+                return "CHECKING LIVENESS"
+            return "ATTENDANCE RECORDED" if ident.logged else "VERIFIED"
+        if self._pad_mode and ident.pad_state in (antispoof.NOT_CONFIGURED, antispoof.ERROR):
+            return "PAD NOT CONFIGURED"
+        if self._pad_mode and ident.pad_obs and not ident.embs:
+            return "CHECKING LIVENESS"
+        return "VERIFYING IDENTITY" if ident.embs else "TRACKING"
+
+    def track_details(self, tracks: List[Track]) -> List[dict]:
+        """JSON-safe per-track info for the UI. Never contains embeddings."""
+        out = []
+        for tr in tracks:
+            ident = tr.ident
+            out.append({
+                "track_id": int(tr.id), "bbox": [float(v) for v in tr.bbox],
+                "status": self.ui_status(tr),
+                "name": ident.student.name if ident and ident.student else None,
+                "roll_number": ident.student.roll_number if ident and ident.student else None,
+                "det_score": float(tr.last_det.score) if tr.last_det is not None else None,
+                "similarity": float(ident.similarity) if ident and ident.student else None,
+                "pad_state": ident.pad_state if (ident and self._pad_mode) else None,
+                "pad_real_prob": float(ident.pad_real_mean) if (ident and self._pad_mode and ident.pad_obs) else None,
+                "hint": ident.hint if ident else "",
+            })
+        return out
 
     # ---------------------------------------------------------------- drawing
     def _draw(self, canvas: np.ndarray, tracks: List[Track], info: Dict) -> np.ndarray:
@@ -459,6 +668,13 @@ class GatePipeline:
                 color = AMBER
                 label = "Verifying" + (f" ({ident.hint})" if ident and ident.hint else "...")
 
+            if self._pad_mode and ident:
+                ui = self.ui_status(tr)
+                if ui in ("CHECKING LIVENESS", "REVIEW REQUIRED", "PAD NOT CONFIGURED", "POSSIBLE SPOOF"):
+                    color = {"CHECKING LIVENESS": PURPLE, "REVIEW REQUIRED": GREY, "PAD NOT CONFIGURED": GREY,
+                             "POSSIBLE SPOOF": RED}[ui]
+                    who = f"{ascii_safe(ident.student.name)} - " if ident.student else ""
+                    label = who + ui.title() if ui != "POSSIBLE SPOOF" else "Possible spoof"
             x1, y1, x2, y2 = [int(v) for v in tr.bbox]
             cv2.rectangle(canvas, (x1, y1), (x2, y2), color, th + 1)
             if len(tr.history) > 1:
@@ -474,7 +690,8 @@ class GatePipeline:
             f"FPS {info['fps']:.1f} | detect {self.det_ms:.0f} ms | match {self.rec_ms:.0f} ms",
             f"Faces {info['faces']} | recognised {len(info['identified'])} | unknown {info['unknown']} "
             f"| logged {self.session_logged}",
-            f"Engine: {info['provider']}",
+            f"Engine: {info['provider']}" + (f" | PAD {self.pad_ms:.0f} ms" if self._pad_mode else
+                                              " | Anti-spoofing OFF" if self.s.liveness_mode == "off" else ""),
         ]
         lh = int(26 * fs + 8)
         cv2.rectangle(canvas, (8, 8), (int(560 * fs + 80), 16 + lh * len(lines)), DARK, -1)
