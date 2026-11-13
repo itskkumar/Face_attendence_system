@@ -1,191 +1,203 @@
-<img width="1463" height="833" alt="Screenshot 2026-10-20 at 9 39 55 PM" src="https://github.com/user-attachments/assets/83604afb-c8fc-4f26-b0d8-e2ccdb19527d" />
-# Real-Time Face Recognition, Attendance & Counting System — v2
+# Face Attendance System
+<img width="1470" height="835" alt="Screenshot 2026-11-13 at 5 34 57 PM" src="https://github.com/user-attachments/assets/8f816f5c-96b7-48d8-b236-2b54e235ea2a" />
 
-Gate-camera attendance for a college: detects **every** face in view (groups of 3+ are fine), tracks each
-person, recognises them, and logs one attendance row per person per cooldown window. Built for an
-**Apple-Silicon Mac** (ONNXRuntime + CoreML), with a live **Streamlit** dashboard.
+
+Camera-based attendance with face recognition and anti-spoofing, a FastAPI backend and a React web app.
+
+- **Detection + recognition:** InsightFace `buffalo_l` (SCRFD-10G detector, ArcFace `w600k_r50` embeddings) on ONNX Runtime
+- **Tracking:** ByteTrack-style tracker (Kalman filter, Hungarian matching)
+- **Matching:** cosine similarity with a margin rule, multi-template per student, FAISS HNSW or NumPy gallery
+- **Anti-spoofing (presentation-attack detection):** pretrained MiniFASNet (Silent-Face-Anti-Spoofing) running as an independent gate
+- **Web app:** Next.js + React + TypeScript, glassmorphism UI, live camera page, enrollment, analytics, admin tools
+- **API:** FastAPI + WebSocket, role-based access (admin / operator / student)
+- **Legacy UI:** the original Streamlit app (`dashboard.py`, `pages/`) is still in the repo
+
+> Biometric data warning: face images and templates are personal data. Read [Privacy](#privacy-and-security) before using this with real people.
+
+---
+
+## How it works
 
 ```
-Camera / MP4 / browser webcam
-        │
-        ▼
- FrameGrabber (thread keeps only the NEWEST frame → no RTSP lag; auto-reconnect)
-        │
-        ▼
- SCRFD-10G face + 5-landmark detector   ── every Nth frame (Kalman-predicted boxes in between)
-        │
-        ▼
- ByteTrack-style tracker: Kalman filter + Hungarian assignment + Mahalanobis gating,
- 2-stage association (low-confidence boxes rescue blurred/occluded faces)
-        │            one persistent ID per person
-        ▼
- Quality gate per track: face size · detector score · pose · blur (Laplacian variance)
-        │            only GOOD frames ("keyframes") continue
-        ▼
- Umeyama SVD alignment → 112×112 → ArcFace-R50 → 512-d unit vector
-        │
-        ▼
- Voting: quality-weighted average of several keyframes → cosine similarity vs all templates
-         (multi-template, best-vs-second-best margin) → identity locked only when keyframes agree
-        │                         └─ no match after N keyframes → red "Unknown" (never logged)
-        ▼
- AttendanceLogger: in-memory last_seen_dict + atomic SQLite check → one row per cooldown (default 5 min)
-        │             identified tracks are periodically RE-VERIFIED (guards against track-ID swaps)
-        ▼
- SQLite (WAL)  ◄──────────────  Streamlit dashboard (auto-refresh 3 s) / CSV export
+ Camera / RTSP / file / browser webcam
+              |
+      [ Gate worker process ]  one FaceEngine + one PAD session
+        SCRFD detect -> track -> quality gates -> ArcFace embed -> match
+                                    |
+                           MiniFASNet PAD gate (liveness)
+              |
+   attendance written only if identity is verified AND the face is LIVE
+              |
+ SQLite  <--  [ FastAPI ]  <--REST + WebSocket-->  [ Next.js web app ]
 ```
 
-## Quick start (Apple Silicon Mac)
+Recognition says **who** the person is. Anti-spoofing says **whether a real face is present**. In `minifas` mode no code
+path (immediate lock, deferred/fast-moving, retry, re-verify) writes attendance unless the track's PAD state is `LIVE`.
+`UNCERTAIN`, `NOT_CONFIGURED` and `ERROR` never count as live. If a track that was already identified later reads as a
+spoof, further logging for it stops, an audit entry and a flagged `pad_events` row are written, and the saved attendance row
+is kept.
 
-```bash
-# 1. native arm64 Python 3.10-3.12 (3.11 recommended; NOT 3.13/3.14 - ML wheels are missing)
-python3.11 -c "import platform; print(platform.machine())"        # must print arm64
-xcode-select --install                                           # once
+## Repository layout
 
-# 2. environment
-cd face_attendance_v2
-python3.11 -m venv venv && source venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt            # first run later downloads ~280 MB of models
-
-# 3. (recommended, once) find the fastest ONNXRuntime provider on YOUR machine
-python benchmark.py
-
-# 4. run
-python database_setup.py                    # optional; every tool creates the DB if missing
-streamlit run dashboard.py                  # dashboard + Live Feed + Enrollment pages in the sidebar
-```
-
-Then in the browser: **Enrollment** page → enrol yourself (3-5 photos, turn your head slightly between
-shots) → **Live Feed** page → pick a source → watch the box turn green and the **Dashboard** count go up.
-
-### Command-line tools (same engine, no browser)
-
-```bash
-python enrollment.py                                         # guided webcam capture (5 poses, auto-capture)
-python enrollment.py --name "Asha Kumari" --roll 23CS24 --folder ./photos/asha   # from photos
-python inference.py --source webcam                          # live webcam, OpenCV window, q to quit
-python inference.py --source rtsp --url rtsp://user:pass@192.168.1.64:554/Streaming/Channels/101
-python inference.py --source file --path gate_clip.mp4 --no-display              # recorded CCTV clip
-```
-Run `inference.py` in one terminal and `streamlit run dashboard.py` in another: the dashboard shows what
-the engine logs, live. (Switching Streamlit *pages* stops a stream that page is running — for a permanent
-gate deployment run `inference.py` and keep the dashboard open in a browser tab.)
-
-## What the Live Feed page offers
-
-| Source | Notes |
+| Path | Purpose |
 |---|---|
-| Upload a video (CCTV `.mp4`) | every frame analysed, nothing dropped; optional annotated-video download |
-| Video file by path | same, without the upload-size round trip |
-| Server webcam | the camera of the machine running Streamlit |
-| RTSP camera | threaded grabber, TCP transport, reconnect with backoff |
-| Browser webcam (WebRTC) | the visitor's own camera; works on `localhost`/HTTPS; a public site may need a TURN server |
+| `face_engine.py`, `tracker.py`, `vision_math.py`, `database.py` | recognition core (detector, tracker, alignment, gallery/matching, SQLite store) |
+| `pipeline.py` | per-frame decision logic (quality gates, voting, cooldown, gate line, PAD hooks) |
+| `antispoof.py`, `pad_store.py` | MiniFASNet PAD module and its database helpers |
+| `backend/` | FastAPI app, gate worker process, auth, services |
+| `frontend/` | Next.js web app |
+| `tools/` | `convert_minifas.py` (weights to ONNX), `pad_eval.py` (APCER/BPCER measurement) |
+| `tests/` | pytest suite (including simulated PAD tests and a golden regression with liveness off) |
+| `dashboard.py`, `pages/` | legacy Streamlit UI |
+| `docs/` | API contract, running guide, upgrade status |
+| `data/` | database, models, camera config (mostly git-ignored) |
 
-The sidebar exposes the main thresholds (similarity, sharpness, frontal-ness, detect interval, cooldown,
-virtual ENTRY/EXIT line) so you can tune live against your own camera.
+## Requirements
 
-## Tuning for your camera (important)
+- macOS or Linux, **Python 3.11 or 3.12** (the pinned `numpy==1.26.4` / `opencv-python==4.10.0.84` do not install on 3.13+)
+- Node.js 20 or newer
+- Internet on first run (InsightFace downloads `buffalo_l`)
+- A webcam, RTSP camera, or video file
 
-All defaults live in `config.py → Settings`. They are sensible starting points, **not** calibrated to your
-camera:
+## Setup
 
-* **Similarity threshold (0.45)** — on real test faces, *different* people scored −0.09…0.20, while the
-  same person (augmented copies of one photo, video-compressed) scored 0.58–0.97. That last range is
-  optimistic: a *different* photo of the same person, e.g. CCTV vs. enrolment, will usually score lower.
-  Raise the threshold if a stranger is accepted; lower it if enrolled people stay "Unknown". Calibrate on
-  your own enrolled students.
-* **Sharpness gate (15 live / 30 enrolment)** — the amber label says *blurry* when a face is rejected;
-  lower the slider for soft CCTV streams.
-* **Frontal-ness gate (0.45)** — in a normal group photo 3 of 6 faces scored below 0.55, so don't set it high.
-* **Detect every N frames** — raise it (3-4) if the Air gets warm; boxes still update every frame.
-* **Camera placement** — face ≥ ~80-100 px wide, camera slightly above eye level, enable the camera's WDR
-  for backlit gates.
+```bash
+git clone https://github.com/itskkumar/Face_attendence_system.git
+cd Face_attendence_system
+git checkout feature/react-ui-and-pad        # or main, once merged
+
+python3.12 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt -r requirements-api.txt pytest
+python -m pytest tests -q -rs
+```
+
+Frontend:
+
+```bash
+cd frontend
+cp .env.example .env.local
+npm install
+```
+
+## Anti-spoofing weights (one-time)
+
+The pretrained weights are not stored in git as PyTorch files; convert them to ONNX once. This uses a separate throw-away
+virtual environment, because it needs torch and the runtime environment stays torch-free.
+
+```bash
+python3.12 -m venv /tmp/conv && source /tmp/conv/bin/activate
+pip install torch onnx onnxruntime numpy
+git clone https://github.com/minivision-ai/Silent-Face-Anti-Spoofing /tmp/sfas
+python tools/convert_minifas.py --repo /tmp/sfas --out data/models/antispoofing
+deactivate
+```
+
+This writes two `.onnx` files and pins their SHA-256 in `data/models/antispoofing/MODELS.json`. The loader refuses any
+file that is not a valid model matching the manifest (HTML pages, wrong hash, wrong shapes) and reports `ERROR` or
+`NOT_CONFIGURED` instead of a score. The preprocessing follows the official project: crop at scale 2.7 / 4.0 around the
+face box (shifted, not squashed), 80x80, BGR, values 0-255 (not divided by 255), 3-class softmax, class 1 = real.
+
+## Run
+
+Use three terminals, in this order. From the project folder with the venv active:
+
+```bash
+# 1. gate worker: owns the camera and the models
+PYTHONPATH=. python -m backend.worker
+
+# 2. API (prints a one-time setup token on first start)
+PYTHONPATH=. uvicorn backend.app:app --host 127.0.0.1 --port 8000
+
+# 3. website
+cd frontend && npm run dev
+```
+
+Open <http://localhost:3000>. On first run enter the setup token from terminal 2 and create the admin account. There are
+no default credentials.
+
+To turn anti-spoofing on, open **Live**, set the liveness mode to `minifas` in the tuning panel. The default stays `off`
+until you have validated the model on your own camera.
+
+## Accounts and roles
+
+| Role | Can do |
+|---|---|
+| `admin` | everything: live control, enrollment, students, users, cameras, inspector, audit |
+| `operator` | read-only monitoring: dashboard, search, live preview, security alerts |
+| `student` | only their own attendance, profile and summary |
+
+- Students are enrolled in **Enrollment**. A login account is separate: create it in **Users** with "Create student accounts".
+  A one-time temporary password is shown once and must be changed at first sign-in.
+- Roles are enforced on the server for every route and WebSocket; the UI only hides things.
+- Passwords use Argon2id; sessions are server-side with an HTTP-only SameSite cookie, CSRF header, and login rate limiting.
+- Accounts migrated from the old Streamlit `users` table have no password until an admin sets a temporary one.
+
+## Evaluating anti-spoofing on your camera
+
+No accuracy figure is claimed by this project. Measure it:
+
+1. Record `live/` (real people, varied lighting, distance, glasses) and `spoof/` (phone replay, tablet, printed photo) at the real gate.
+2. Run:
+   ```bash
+   python tools/pad_eval.py --live data/pad_eval/live --spoof data/pad_eval/spoof
+   python tools/pad_eval.py --benchmark     # CPU vs CoreML latency
+   ```
+3. It prints **APCER** (attacks accepted as live), **BPCER** (real faces rejected), and a threshold sweep. Choose
+   `pad_real_threshold` / `pad_spoof_threshold` in `config.py` from your own data.
+
+Keep recordings out of git (`data/pad_eval/` is git-ignored): they are biometric data.
+
+## Configuration
+
+- Recognition thresholds and PAD settings live in `config.py` (`Settings`). Existing recognition defaults (similarity 0.45,
+  margin 0.05, min votes 3, ...) are unchanged by the anti-spoofing upgrade.
+- Environment variables: see `.env.example` (`ALLOWED_ORIGINS`, `COOKIE_SECURE`, `WORKER_PORT`, `PAD_PROVIDER`,
+  `ENROLL_REQUIRE_LIVENESS`).
+- Cameras are managed on the **Cameras** page and stored server-side in `data/cameras.json`. RTSP URLs and passwords are
+  never sent to the browser; the API returns a masked form.
 
 ## Tests
 
 ```bash
-pip install pytest
-python -m pytest tests -q          # 48 tests, ~1 min on CPU
+python -m pytest tests -q -rs          # backend + PAD + golden regression
+cd frontend && npm run typecheck && npm test
 ```
 
-| Area | What is verified |
-|---|---|
-| Math | Umeyama recovers a known transform, is least-squares optimal, **matches InsightFace's own reference transform**; blur/pose metrics |
-| Tracker | stable IDs for 3 people walking together, with 25 % missed detections, with low-confidence frames, with crossing paths; ghost-track pruning |
-| Database | multi-template matching, margin rule, duplicate-identity refusal, **cooldown atomic under 16 concurrent writers**, today-only counts, restart hydration |
-| Pipeline logic (scripted fake models) | group of 4 (3 known + 1 unknown), cooldown expiry, blur/size gating, Unknown handling, **ID-swap re-verification**, ENTRY/EXIT line, live enrolment pickup, no box flicker when the detector is skipped |
-| **Real models** | enrols 3 people from a real group photo, runs a compressed video: the 3 are logged exactly once, 1 stranger is "Unknown", 2 turned-away faces are *not judged* |
-| UI | every page renders; a video file is processed through the Live Feed page; the WebRTC processor handles real `av.VideoFrame`s end-to-end |
+The PAD gating tests use a simulated provider to prove the gating logic (they do not measure model accuracy). The golden
+test proves that with `liveness_mode="off"` the pipeline behaves exactly as it did before the anti-spoofing upgrade.
 
-All of the above ran on Linux x86 / Python 3.12 with the same pinned versions you install.
+## Resetting data
 
-**Not testable here (no Mac, no camera, no display):** CoreML acceleration and real FPS on your M4, a
-physical webcam, a real RTSP camera, the OpenCV preview window (`cv2.imshow`), and the in-browser WebRTC
-handshake. `benchmark.py` measures the first on your machine; the others fail with explicit, actionable
-messages. Expect to spend a few minutes tuning thresholds against your own camera.
+Stop the worker and API, back up `data/attendance_system.db`, then delete rows with `sqlite3` or remove the file to start
+completely fresh (the first-run setup then appears again). Restart the worker afterwards.
 
-## Known limitations (read before demoing)
+## Privacy and security
 
-* **No real anti-spoofing.** A printed photo or phone screen can be accepted. The optional *FFT liveness*
-  switch is an **unvalidated heuristic** and is off by default; production use needs a trained model
-  (e.g. MiniFASNet).
-* Two people whose boxes overlap **exactly** can swap track IDs — any motion-only tracker can. The pipeline
-  re-verifies identities every ~2 s and resets a track after two disagreements, so a swap self-corrects.
-* Recognition is only as good as enrolment: use 3-5 sharp photos at slightly different angles.
-* Masks, heavy sunglasses, very low light and faces < ~60 px wide degrade accuracy.
-* On-screen labels use OpenCV fonts (ASCII only): accents are folded and non-Latin names show as `?`.
-  Tables and CSV keep the full Unicode name.
-* The detector in InsightFace's `buffalo_l` pack is **SCRFD-10G** (the Python class that runs it is named
-  `RetinaFace`). Say "SCRFD" if asked which detector this uses.
-* Face data is biometric personal data: get consent, restrict access to `data/attendance_system.db`, and
-  follow your institution's policy.
+- Embeddings and templates are never sent to the browser or over WebSockets, and are never logged.
+- Snapshots are off by default (`save_snapshots=False`).
+- Use HTTPS and `COOKIE_SECURE=1` for anything beyond a trusted local network.
+- Whether and how you may process faces (for example under India's DPDP Act, GDPR, or school/institution policy) needs
+  review by your institution. This project does not claim legal compliance.
 
-## Troubleshooting
+## Limitations
 
-| Symptom | Fix |
-|---|---|
-| `Could not find a version that satisfies onnxruntime` | you are on Python 3.13/3.14 → recreate the venv with `python3.11` |
-| Camera denied / `OpenCV: camera failed to properly initialize` | System Settings → Privacy & Security → Camera → enable your terminal → **quit and reopen** it. The Enrollment page uses the browser camera instead |
-| `streamlit-webrtc` import error / page crash after upgrading | keep `streamlit==1.45.1` (newer Streamlit dropped Tornado) |
-| `pyarrow requires NumPy 2` | keep `pyarrow<21` and `numpy==1.26.4` as pinned |
-| RTSP black/laggy | test the URL in VLC; use the camera's *sub-stream*; the grabber already forces TCP |
-| Everyone is "Unknown" | enrol first; lower the similarity slider a little; check lighting and the amber hint text |
-| Warm MacBook Air | raise *Detect every N frames*, lower `target_fps`, run `benchmark.py` |
+- A single-frame PAD model can be fooled by high-quality 3D masks, replays tuned against the model, or injection
+  attacks on the camera feed. Treat it as one layer, not proof.
+- Models were trained on phone-style portrait frames; a wide gate camera may behave differently. Calibrate on your own data.
+- Tracks that are already identified and LIVE are re-checked only at the re-verify interval.
+- Face-recognition accuracy depends on camera placement, lighting and enrollment quality.
 
-## Files
+## Model licenses
 
-| File | Role |
-|---|---|
-| `dashboard.py`, `pages/1_Live_Feed.py`, `pages/2_Enrollment.py`, `ui_common.py`, `webrtc_processor.py` | Streamlit app |
-| `inference.py`, `enrollment.py`, `database_setup.py`, `benchmark.py` | command-line tools |
-| `pipeline.py` | detection → tracking → quality gate → voting → logging → drawing |
-| `tracker.py`, `vision_math.py` | Kalman/ByteTrack tracker; Umeyama, blur, pose, FFT utilities |
-| `face_engine.py` | InsightFace wrapper, CoreML provider selection + fallback |
-| `database.py`, `attendance.py`, `enrollment_core.py`, `video_sources.py`, `config.py` | storage, cooldown logger, enrolment checks, readers, settings |
+- **Face detection/recognition:** InsightFace `buffalo_l`. Check the InsightFace model license for your intended use; it is
+  not a blanket commercial license.
+- **Anti-spoofing:** MiniFASNet from [minivision-ai/Silent-Face-Anti-Spoofing](https://github.com/minivision-ai/Silent-Face-Anti-Spoofing),
+  Apache License 2.0 (verify the `LICENSE` in that repository for the version you use).
 
----
+## Docs
 
-## Upgrade: React UI + MiniFASNet anti-spoofing (branch `feature/react-ui-and-pad`)
-
-See `docs/RUNNING.md` (start-up), `docs/API_CONTRACT.md`, `docs/PHASE1_AUDIT.md` (audit of the original code) and
-`docs/UPGRADE_STATUS.md` (what is verified and what is not - read this first).
-
-**Anti-spoofing design.** ArcFace says *who*; PAD (`antispoof.py`) says *whether a real face is present*. In
-`liveness_mode="minifas"` no code path (immediate lock, deferred/fast-moving, retry, re-verify) logs attendance unless the track's
-`pad_state == LIVE`, which needs `pad_min_obs` valid MiniFASNet observations whose mean real-probability and individual passes clear
-the thresholds. UNCERTAIN, NOT_CONFIGURED and ERROR never count as live. A previously identified track that later reads SPOOF
-is stopped, an audit entry and a flagged `pad_events` row are written, and the already-saved attendance row is left in place.
-`fft_experimental` remains an unvalidated legacy heuristic and can never mean LIVE.
-
-**Models and licences.** Face detection/recognition weights are InsightFace `buffalo_l`: check the InsightFace model licence
-for your deployment (it is not a blanket commercial licence). PAD: MiniFASNet from minivision-ai/Silent-Face-Anti-Spoofing, believed
-Apache-2.0 - **verify the LICENSE in that repo** (recorded as unverified in `MODELS.json`).
-
-**Limitations.** No accuracy figure is claimed anywhere: PAD thresholds are uncalibrated starting points until you measure APCER/BPCER
-with `tools/pad_eval.py` on data from your own gate. A single-frame PAD model is not proof against high-quality 3D masks, video replay
-tuned to the model, or injection attacks; treat it as one layer. Identified, LIVE tracks are re-checked only at the re-verify cadence.
-
-**Privacy.** Face images and templates are biometric personal data. Embeddings never leave the worker/DB and are never sent to the
-browser or logged; snapshots stay off (`save_snapshots=False`); RTSP URLs stay server-side and are masked. Compliance with
-India's DPDP Act (or any other law) needs review by your institution - nothing here claims compliance.
+- [`docs/RUNNING.md`](docs/RUNNING.md): start-up details
+- [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md): REST and WebSocket contract
+- [`docs/UPGRADE_STATUS.md`](docs/UPGRADE_STATUS.md): what was verified and what was not
+- [`docs/PHASE1_AUDIT.md`](docs/PHASE1_AUDIT.md): audit of the original code
