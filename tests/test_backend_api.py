@@ -22,6 +22,21 @@ from test_pipeline_logic import emb                                # noqa: E402
 ORIGIN = {"Origin": "http://localhost:3000"}
 
 
+def ck(c):
+    """TestClient does not attach cookies to WebSocket handshakes, so send the session cookie explicitly."""
+    return {**ORIGIN, "Cookie": f"{COOKIE}={c.cookies.get(COOKIE)}"}
+
+
+def _has_embedding_data(o):
+    if isinstance(o, dict):
+        return any(k.lower() in {"embedding", "embeddings", "vector", "blob"} or _has_embedding_data(v) for k, v in o.items())
+    if isinstance(o, list):
+        if len(o) >= 64 and all(isinstance(x, (int, float)) for x in o):
+            return True
+        return any(_has_embedding_data(x) for x in o)
+    return False
+
+
 class FakeWorker:                                                  # SIMULATED worker link
     status = {"running": False, "fps": 0, "pad": {"state": "NOT_CONFIGURED", "reason": "x", "model_id": "none", "models": []},
               "liveness_mode": "off", "provider": "", "proc_ms": 0, "det_ms": 0, "rec_ms": 0, "pad_ms": 0, "settings": {}}
@@ -116,7 +131,9 @@ def test_no_embeddings_or_credentials_in_any_get(ctx):
         r = c.get(path)
         assert r.status_code == 200, (path, r.text)
         low = r.text.lower()
-        assert "embedding" not in low and "hunter2" not in low, path
+        assert "hunter2" not in low, path
+        if r.headers.get("content-type", "").startswith("application/json"):
+            assert not _has_embedding_data(r.json()), path
 
 
 def test_rate_limit_returns_429(ctx):
@@ -164,11 +181,11 @@ def test_websocket_auth_and_origin(ctx):
         with c.websocket_connect("/ws/events", headers={"Origin": "http://evil.example"}):
             pass
     assert e.value.code == 4403
-    with c.websocket_connect("/ws/events", headers=ORIGIN) as ws:
+    with c.websocket_connect("/ws/events", headers=ck(c)) as ws:
         assert ws.receive_json()["kind"] == "status"
     c.cookies.clear(); login(c, "R1", "student-password-1")
     with pytest.raises(WebSocketDisconnect) as e:
-        with c.websocket_connect("/ws/preview", headers=ORIGIN):
+        with c.websocket_connect("/ws/preview", headers=ck(c)):
             pass
     assert e.value.code == 4403
 

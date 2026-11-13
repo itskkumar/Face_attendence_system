@@ -29,7 +29,7 @@ describe("api client error states", () => {
   });
 
   it("sends the CSRF header on non-GET requests only", async () => {
-    const f = vi.fn().mockResolvedValue(jsonResponse({ ok: true }));
+    const f = vi.fn().mockImplementation(async () => jsonResponse({ ok: true }));
     vi.stubGlobal("fetch", f);
     setCsrf("tok123");
     await api("/students/R1", { method: "DELETE" });

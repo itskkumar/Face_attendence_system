@@ -38,7 +38,8 @@ def main():
     import torch
 
     sys.path.insert(0, args.repo)
-    from src.model_lib.MiniFASNet import MODEL_MAPPING          # noqa: E402
+    import src.model_lib.MiniFASNet as _M                        # noqa: E402
+    MODEL_MAPPING = {n: getattr(_M, n) for n in ('MiniFASNetV1', 'MiniFASNetV2', 'MiniFASNetV1SE', 'MiniFASNetV2SE')}
     from src.utility import get_kernel, parse_model_name         # noqa: E402
 
     manifest_path = os.path.join(args.out, "MODELS.json")
@@ -70,7 +71,7 @@ def main():
         out_path = os.path.join(args.out, entry["file"])
         dummy = torch.randn(1, 3, h_in, w_in) * 40 + 120          # 0..255-ish range, like real input
         torch.onnx.export(wrapped, dummy, out_path, input_names=["input"], output_names=["probs"],
-                          opset_version=12)
+                          opset_version=12, dynamo=False)
         sess = ort.InferenceSession(out_path, providers=["CPUExecutionProvider"])
         ref = wrapped(dummy).detach().numpy()
         got = sess.run(None, {"input": dummy.numpy()})[0]

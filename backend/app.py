@@ -398,6 +398,8 @@ def create_app(*, auth: Optional[AuthService] = None, store: Optional[Store] = N
 
     @app.post("/api/users/{username}/temporary-password")
     async def users_tmp(username: str, request: Request, sess=Depends(ADMIN)):
+        if username.lower() == sess["user"]["username"].lower():
+            raise HTTPException(409, "You cannot reset your own password here (it would sign you out). Use Change password.")
         tmp = request.app.state.auth.temporary_password(username)
         audit(request, sess["user"]["username"], "user_password_reset", username)
         return {"temporary_password": tmp}

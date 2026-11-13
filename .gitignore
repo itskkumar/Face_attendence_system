@@ -1,17 +1,44 @@
+# python
 venv/
+.venv/
 __pycache__/
+*.pyc
 .pytest_cache/
+
+# databases and runtime data
 data/*.db
 data/*.db-wal
 data/*.db-shm
+data/*.db-journal
 data/provider_choice.json
-*.mp4
-
-.DS_Store
-.claude/
 data/backups/
+data/uploads/
 data/worker.key
 data/worker.lock
-data/uploads/
+
+# secrets and local config
+.env
+.env.*
+!.env.example
+frontend/.env.local
+data/cameras.json
+
+# biometric / recorded data - never commit
+data/pad_eval/
+data/snapshots/
+pad_eval_scores*.csv
+*.mp4
+*.avi
+*.mov
+*.webm
+
+# frontend
 node_modules/
 .next/
+*.tsbuildinfo
+frontend/next-env.d.ts
+
+# misc
+.DS_Store
+.claude/
+*.log

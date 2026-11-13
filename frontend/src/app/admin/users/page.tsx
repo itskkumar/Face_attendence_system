@@ -83,7 +83,7 @@ export default function UsersPage() {
       const u = row.original; const self = u.username === me?.username;
       return (
         <div className="flex justify-end gap-1">
-          <button type="button" aria-label={`Set temporary password for ${u.username}`} title="Set temporary password" onClick={() => temp.mutate(u.username)} className="rounded-lg p-2 text-muted hover:bg-[var(--glass-strong)] hover:text-fg"><KeyRound className="h-4 w-4" /></button>
+          <button type="button" aria-label={`Set temporary password for ${u.username}`} title={me?.username.toLowerCase() === u.username.toLowerCase() ? "You cannot reset your own password here" : "Set temporary password"} disabled={me?.username.toLowerCase() === u.username.toLowerCase()} onClick={() => temp.mutate(u.username)} className="rounded-lg p-2 disabled:cursor-not-allowed disabled:opacity-40 text-muted hover:bg-[var(--glass-strong)] hover:text-fg"><KeyRound className="h-4 w-4" /></button>
           <button type="button" disabled={self} onClick={() => patch.mutate({ username: u.username, body: { disabled: !u.disabled } })} className="rounded-lg px-2 text-xs text-muted hover:bg-[var(--glass-strong)] hover:text-fg disabled:opacity-40">{u.disabled ? "Enable" : "Disable"}</button>
           <button type="button" disabled={self} aria-label={`Delete ${u.username}`} onClick={() => setDeleting(u)} className="rounded-lg p-2 text-danger hover:bg-[var(--glass-strong)] disabled:opacity-40"><Trash2 className="h-4 w-4" /></button>
         </div>);
