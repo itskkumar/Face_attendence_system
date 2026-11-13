@@ -1,0 +1,10 @@
+# Additional packages for the FastAPI backend (backend/). Install into the SAME venv as requirements.txt;
+# none of these touch the pinned numpy/opencv/insightface/streamlit/pyarrow/onnxruntime versions.
+# Versions are pinned to releases believed compatible; they could not be resolved against PyPI when this
+# file was written (no network) - if pip complains, relax the pin, do not touch requirements.txt.
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.20
+argon2-cffi==23.1.0
+psutil==6.1.0
+httpx==0.28.1            # only for tests/test_backend_api.py

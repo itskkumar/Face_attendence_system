@@ -6,3 +6,12 @@ data/*.db-wal
 data/*.db-shm
 data/provider_choice.json
 *.mp4
+
+.DS_Store
+.claude/
+data/backups/
+data/worker.key
+data/worker.lock
+data/uploads/
+node_modules/
+.next/

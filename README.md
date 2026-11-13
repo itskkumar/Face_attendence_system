@@ -163,3 +163,29 @@ messages. Expect to spend a few minutes tuning thresholds against your own camer
 | `tracker.py`, `vision_math.py` | Kalman/ByteTrack tracker; Umeyama, blur, pose, FFT utilities |
 | `face_engine.py` | InsightFace wrapper, CoreML provider selection + fallback |
 | `database.py`, `attendance.py`, `enrollment_core.py`, `video_sources.py`, `config.py` | storage, cooldown logger, enrolment checks, readers, settings |
+
+---
+
+## Upgrade: React UI + MiniFASNet anti-spoofing (branch `feature/react-ui-and-pad`)
+
+See `docs/RUNNING.md` (start-up), `docs/API_CONTRACT.md`, `docs/PHASE1_AUDIT.md` (audit of the original code) and
+`docs/UPGRADE_STATUS.md` (what is verified and what is not - read this first).
+
+**Anti-spoofing design.** ArcFace says *who*; PAD (`antispoof.py`) says *whether a real face is present*. In
+`liveness_mode="minifas"` no code path (immediate lock, deferred/fast-moving, retry, re-verify) logs attendance unless the track's
+`pad_state == LIVE`, which needs `pad_min_obs` valid MiniFASNet observations whose mean real-probability and individual passes clear
+the thresholds. UNCERTAIN, NOT_CONFIGURED and ERROR never count as live. A previously identified track that later reads SPOOF
+is stopped, an audit entry and a flagged `pad_events` row are written, and the already-saved attendance row is left in place.
+`fft_experimental` remains an unvalidated legacy heuristic and can never mean LIVE.
+
+**Models and licences.** Face detection/recognition weights are InsightFace `buffalo_l`: check the InsightFace model licence
+for your deployment (it is not a blanket commercial licence). PAD: MiniFASNet from minivision-ai/Silent-Face-Anti-Spoofing, believed
+Apache-2.0 - **verify the LICENSE in that repo** (recorded as unverified in `MODELS.json`).
+
+**Limitations.** No accuracy figure is claimed anywhere: PAD thresholds are uncalibrated starting points until you measure APCER/BPCER
+with `tools/pad_eval.py` on data from your own gate. A single-frame PAD model is not proof against high-quality 3D masks, video replay
+tuned to the model, or injection attacks; treat it as one layer. Identified, LIVE tracks are re-checked only at the re-verify cadence.
+
+**Privacy.** Face images and templates are biometric personal data. Embeddings never leave the worker/DB and are never sent to the
+browser or logged; snapshots stay off (`save_snapshots=False`); RTSP URLs stay server-side and are masked. Compliance with
+India's DPDP Act (or any other law) needs review by your institution - nothing here claims compliance.

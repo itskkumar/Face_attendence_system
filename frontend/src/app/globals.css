@@ -1,0 +1,57 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Design tokens (space-separated RGB so Tailwind can apply alpha). Dark first. */
+:root {
+  --bg: 8 10 22; --fg: 233 236 248; --muted: 148 156 184; --surface: 20 24 46; --line: 255 255 255;
+  --primary: 129 110 255; --accent: 34 211 238; --success: 34 197 94; --warn: 234 179 8;
+  --danger: 239 68 68; --purple: 168 85 247; --orange: 249 115 22; --info: 59 130 246;
+  --glass: rgb(255 255 255 / 0.055); --glass-strong: rgb(255 255 255 / 0.09); --glass-border: rgb(255 255 255 / 0.12);
+  --shadow: 0 10px 40px -12px rgb(0 0 0 / 0.6);
+  color-scheme: dark;
+}
+:root.light {
+  --bg: 240 243 252; --fg: 18 22 40; --muted: 98 106 134; --surface: 255 255 255; --line: 15 23 42;
+  --primary: 91 70 235; --accent: 8 145 178; --success: 22 163 74; --warn: 202 138 4;
+  --danger: 220 38 38; --purple: 147 51 234; --orange: 234 88 12; --info: 37 99 235;
+  --glass: rgb(255 255 255 / 0.62); --glass-strong: rgb(255 255 255 / 0.85); --glass-border: rgb(15 23 42 / 0.1);
+  --shadow: 0 10px 40px -14px rgb(30 41 90 / 0.25);
+  color-scheme: light;
+}
+
+html, body { height: 100%; }
+body {
+  background: rgb(var(--bg)); color: rgb(var(--fg));
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased; overflow-x: hidden;
+}
+body::before {
+  content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+  background:
+    radial-gradient(60rem 40rem at 10% -10%, rgb(var(--primary) / 0.18), transparent 60%),
+    radial-gradient(50rem 40rem at 100% 0%, rgb(var(--accent) / 0.12), transparent 60%);
+}
+
+@layer components {
+  .glass {
+    background: var(--glass); border: 1px solid var(--glass-border);
+    backdrop-filter: blur(18px) saturate(140%); -webkit-backdrop-filter: blur(18px) saturate(140%);
+    box-shadow: var(--shadow);
+  }
+  .glass-strong { background: var(--glass-strong); }
+  .field {
+    @apply w-full rounded-xl border bg-transparent px-3 py-2 text-sm outline-none transition;
+    border-color: var(--glass-border);
+  }
+  .field:focus { border-color: rgb(var(--primary) / 0.8); box-shadow: 0 0 0 3px rgb(var(--primary) / 0.2); }
+  .field::placeholder { color: rgb(var(--muted) / 0.7); }
+  select.field option { background: rgb(var(--surface)); color: rgb(var(--fg)); }
+  .label { @apply mb-1 block text-xs font-medium; color: rgb(var(--muted)); }
+}
+
+*:focus-visible { outline: 2px solid rgb(var(--accent)); outline-offset: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; scroll-behavior: auto !important; }
+}
